@@ -1601,12 +1601,25 @@ Item {
                                     visible: row.isApp && row.appIcon !== ""
                                     width: Style.space(28)
                                     height: Style.space(28)
-                                    source: visible && appLibrary ? appLibrary.iconSource(row.appIcon) : ""
+                                    source: {
+                                        if (!visible) return "";
+                                        var name = String(row.appIcon||"");
+                                        if (!name) return "";
+                                        if (appLibrary) {
+                                            var s = appLibrary.iconSource(name);
+                                            if (s && String(s).length) return s;
+                                        }
+                                        // Fallback to Quickshell.iconPath when appLibrary unavailable or returns empty
+                                        var qp = Quickshell.iconPath(name, true);
+                                        if (qp && String(qp).length) return qp;
+                                        return "";
+                                    }
                                     fillMode: Image.PreserveAspectFit
                                     sourceSize.width: width * Screen.devicePixelRatio
                                     sourceSize.height: height * Screen.devicePixelRatio
                                     asynchronous: true
                                     anchors.verticalCenter: parent.verticalCenter
+                                    onStatusChanged: if (status === Image.Error) visible = false
                                 }
                                 Image {
                                     id: fileIconImage
