@@ -1109,11 +1109,11 @@ Item {
                                     color: root.foreground
                                     opacity: 0.85
                                     anchors.verticalCenter: parent.verticalCenter
-                                    x: root.filterText ? Math.min(inputText.paintedWidth + 4, parent.width - 6) : 4
-                                    visible: keyCatcher.activeFocus
+                                    x: Math.min(inputText.paintedWidth + 4, parent.width - 6)
+                                    visible: keyCatcher.activeFocus && root.filterText
                                     SequentialAnimation on opacity {
                                         loops: Animation.Infinite
-                                        running: keyCatcher.activeFocus
+                                        running: keyCatcher.activeFocus && root.filterText
                                         NumberAnimation { to: 0.2; duration: 600; easing.type: Easing.InOutQuad }
                                         NumberAnimation { to: 0.85; duration: 600; easing.type: Easing.InOutQuad }
                                     }
