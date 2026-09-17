@@ -332,11 +332,11 @@ Item {
                 entries.push({name:name, path:full, isDir:isDir, hidden:isHiddenName(name)})
             }
             dirEntries = entries
-            if (root.opened) {
-                // Only rebuild if not in search mode (filter empty or path-like)
+            if (root.opened && !openWithMode) {
+                // Only rebuild if not in search mode and not in Open With
                 var q = String(filterText||"").trim()
                 if (!q || (Fuzzy.isPathLike(q) && q.indexOf('/')!==-1)) root.rebuildDisplay()
-                // If in search mode, keep search results; browsing entries are still updated for later
+                // If in search mode or Open With, keep current display
             }
         }
     }
@@ -396,7 +396,7 @@ Item {
                 })
                 for (var fbi=0; fbi<fallback.length && fbi<30; fbi++){
                     var fe = fallback[fbi]
-                    displayModel.append({name: fe.name + (fe.isDir?"/":""), path: fe.path, isDir: fe.isDir, detail: tildeCollapse(fe.path), hidden: fe.hidden, iconName: iconForPath(fe.path, fe.isDir)})
+                    displayModel.append({name: fe.name + (fe.isDir?"/":""), path: fe.path, isDir: fe.isDir, detail: tildeCollapse(fe.path), hidden: fe.hidden, iconName: iconForPath(fe.path, fe.isDir), appIcon: "", appId: ""})
                 }
                 if (displayModel.count===0) {
                     // keep empty, rebuildDisplay will show "No results"
@@ -459,7 +459,7 @@ Item {
                     dname += "/"
                     if (spath.charAt(spath.length-1) !== "/") spath += "/"
                 }
-                displayModel.append({name: dname, path: spath, isDir: isDirFlag, detail: tildeCollapse(spath), hidden: isHiddenName(Fuzzy.basename(spath)), iconName: iconForPath(spath, isDirFlag)})
+                displayModel.append({name: dname, path: spath, isDir: isDirFlag, detail: tildeCollapse(spath), hidden: isHiddenName(Fuzzy.basename(spath)), iconName: iconForPath(spath, isDirFlag), appIcon: "", appId: ""})
             }
             layoutSerial++
             if (displayModel.count===0) { selectedIndex=0; cursorActive=false }
@@ -526,7 +526,7 @@ Item {
                         path: fe.path,
                         isDir: fe.isDir,
                         detail: tildeCollapse(fe.path),
-                        hidden: fe.hidden, iconName: iconForPath(fe.path, fe.isDir)})
+                        hidden: fe.hidden, iconName: iconForPath(fe.path, fe.isDir), appIcon: "", appId: ""})
                 }
                 if (displayModel.count===0 && !isSearching) {
                     displayModel.append({name:"No match", path:"", isDir:false, detail:"Try a different prefix or check hidden (Ctrl+H)", hidden:false, iconName: "dialog-information"})
@@ -555,7 +555,7 @@ Item {
                     path: be.path,
                     isDir: be.isDir,
                     detail: be.isDir ? "" : tildeCollapse(be.path),
-                    hidden: be.hidden, iconName: iconForPath(be.path, be.isDir)})
+                    hidden: be.hidden, iconName: iconForPath(be.path, be.isDir), appIcon: "", appId: ""})
             }
         } else {
             // Small query (<2 chars) or non-path fuzzy on current dir only (no global)
@@ -573,7 +573,7 @@ Item {
                 })
                 for (var sfi=0; sfi<smallFiltered.length && sfi<50; sfi++){
                     var sfe = smallFiltered[sfi]
-                    displayModel.append({name: sfe.name + (sfe.isDir?"/":""), path: sfe.path, isDir: sfe.isDir, detail: tildeCollapse(sfe.path), hidden: sfe.hidden, iconName: iconForPath(sfe.path, sfe.isDir)})
+                    displayModel.append({name: sfe.name + (sfe.isDir?"/":""), path: sfe.path, isDir: sfe.isDir, detail: tildeCollapse(sfe.path), hidden: sfe.hidden, iconName: iconForPath(sfe.path, sfe.isDir), appIcon: "", appId: ""})
                 }
                 if (displayModel.count===0) displayModel.append({name:"No results", path:"", isDir:false, detail:'Type more characters for global search', hidden:false, iconName: "dialog-information"})
             } else {
@@ -591,7 +591,7 @@ Item {
                 })
                 for (var lfi=0; lfi<localFiltered.length && lfi<50; lfi++){
                     var lfe = localFiltered[lfi]
-                    displayModel.append({name: lfe.name + (lfe.isDir?"/":""), path: lfe.path, isDir: lfe.isDir, detail: tildeCollapse(lfe.path), hidden: lfe.hidden, iconName: iconForPath(lfe.path, lfe.isDir)})
+                    displayModel.append({name: lfe.name + (lfe.isDir?"/":""), path: lfe.path, isDir: lfe.isDir, detail: tildeCollapse(lfe.path), hidden: lfe.hidden, iconName: iconForPath(lfe.path, lfe.isDir), appIcon: "", appId: ""})
                 }
                 // If no local results, trigger global search now (if not already)
                 if (displayModel.count===0) {
@@ -1126,8 +1126,20 @@ Item {
                         detail: df.detail,
                         hidden: false,
                         appIcon: df.icon,
-                        appId: df.id
-                    });
+                        appId: df.id,
+                        iconName: ""
+                    })
+                    var _last2 = displayModel.get(displayModel.count-1);
+                    console.log("Omafinder: appended verify appId=" + String(_last2.appId||"") + " appIcon=" + String(_last2.appIcon||"") + " iconName=" + String(_last2.iconName||"") + " isApp=" + (openWithMode && String(_last2.appId||"") !== "") + " count=" + displayModel.count);
+                }
+                if (displayModel.count > 0) {
+                    var _first = displayModel.get(0);
+                    console.log("Omafinder: after direct fallback first entry appId=" + String(_first.appId||"") + " appIcon=" + String(_first.appIcon||"") + " name=" + String(_first.name||"") + " count=" + displayModel.count);
+                }
+                // Verify first entry after loop
+                if (displayModel.count > 0) {
+                    var _first = displayModel.get(0);
+                    console.log("Omafinder: after direct fallback first entry name=" + String(_first.name||"") + " appId=" + String(_first.appId||"") + " appIcon=" + String(_first.appIcon||"") + " isApp=" + (openWithMode && String(_first.appId||"") !== ""));
                 }
                 if (displayModel.count>0) { selectedIndex=0; cursorActive=true; layoutSerial++; Qt.callLater(function(){ resultList.positionViewAtIndex(0, ListView.Contain); }); return; }
             }
@@ -1166,7 +1178,7 @@ Item {
                                 hidden: false,
                                 appIcon: _aicon,
                                 appId: String(fe.id||"")
-                            });
+                            , iconName: ""});
                         }
                         if (displayModel.count>0) { selectedIndex=0; cursorActive=true; layoutSerial++; Qt.callLater(function(){ resultList.positionViewAtIndex(0, ListView.Contain); }); return; }
                     }
@@ -1251,7 +1263,7 @@ Item {
                 hidden: false,
                 appIcon: String(e2.icon||""),
                 appId: String(e2.id||"")
-            })
+            , iconName: ""})
             added++
         }
         if (displayModel.count===0) {
@@ -1644,6 +1656,7 @@ Item {
                                 anchors.bottomMargin: Style.space(6)
                                 spacing: Style.space(10)
 
+                                Component.onCompleted: console.log("Omafinder: delegate created name=" + row.name + " appId=" + row.appId + " appIcon=" + row.appIcon + " isApp=" + row.isApp + " openWithMode=" + openWithMode)
                                 // Icon — app icon when in Open With, else file icon via iconName, fallback to emoji
                                 Image {
                                     id: appIconImage
@@ -1651,7 +1664,7 @@ Item {
                                     width: Style.space(28)
                                     height: Style.space(28)
                                     source: {
-                                        console.log("Omafinder: appIcon source eval visible=" + visible + " isApp=" + row.isApp + " appIcon=" + row.appIcon + " name=" + row.name);
+                                        console.log("Omafinder: appIcon source eval visible=" + visible + " isApp=" + row.isApp + " appIcon=" + row.appIcon + " appId=" + row.appId + " name=" + row.name + " openWithMode=" + openWithMode);
                                         if (!visible) return "";
                                         var name = String(row.appIcon||"");
                                         console.log("Omafinder: appIcon source try name=" + name + " for " + row.name + " visible=" + visible + " isApp=" + row.isApp);
