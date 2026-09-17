@@ -1090,42 +1090,32 @@ Item {
                                 anchors.verticalCenter: parent.verticalCenter
                                 clip: true
                                 Text {
-                                    id: filterDisplay
+                                    id: inputText
                                     textFormat: Text.PlainText
                                     anchors.left: parent.left
-                                    anchors.right: cursorRect.left
+                                    anchors.right: parent.right
                                     anchors.verticalCenter: parent.verticalCenter
-                                    anchors.rightMargin: 2
-                                    text: root.filterText
+                                    text: root.filterText ? root.filterText : "Search or type a path…"
                                     color: root.foreground
+                                    opacity: root.filterText ? 1 : 0.38
                                     font.family: root.fontFamily
                                     font.pixelSize: Style.font.heading
                                     elide: Text.ElideRight
-                                }
-                                Text {
-                                    anchors.fill: parent
-                                    text: root.filterText ? "" : "Search or type a path…"
-                                    color: root.foreground
-                                    opacity: 0.38
-                                    font.family: root.fontFamily
-                                    font.pixelSize: Style.font.heading
-                                    elide: Text.ElideRight
-                                    visible: !root.filterText
                                 }
                                 Rectangle {
                                     id: cursorRect
                                     width: 2
-                                    height: parent.height * 0.55
+                                    height: Style.font.heading * 1.1
                                     color: root.foreground
-                                    opacity: 0.9
+                                    opacity: 0.85
                                     anchors.verticalCenter: parent.verticalCenter
-                                    x: filterDisplay.contentWidth + 2
+                                    x: root.filterText ? Math.min(inputText.paintedWidth + 4, parent.width - 6) : 4
                                     visible: keyCatcher.activeFocus
                                     SequentialAnimation on opacity {
                                         loops: Animation.Infinite
                                         running: keyCatcher.activeFocus
                                         NumberAnimation { to: 0.2; duration: 600; easing.type: Easing.InOutQuad }
-                                        NumberAnimation { to: 0.9; duration: 600; easing.type: Easing.InOutQuad }
+                                        NumberAnimation { to: 0.85; duration: 600; easing.type: Easing.InOutQuad }
                                     }
                                 }
                             }
