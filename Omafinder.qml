@@ -1134,21 +1134,22 @@ Item {
                         root.dismiss()
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_C) {
-                        // Copy file (uri-list) for paste
-                        if (displayModel.count>0 && cursorActive) {
-                            var crow = displayModel.get(selectedIndex)
-                            if (crow.path) copyFileToClipboard(crow.path, "copy")
-                            // Keep copied path visible? Don't dismiss immediately? But spec says dismiss — we will keep clipboard and dismiss
-                            root.dismiss()
-                        }
-                        event.accepted = true
-                    } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_C) {
-                        // Copy path of selected (Ctrl+C)
+                        // Copy path (Ctrl+Shift+C) — swapped per request
                         if (displayModel.count>0 && cursorActive) {
                             var row = displayModel.get(selectedIndex)
                             root.copyPath(row.path)
                         } else if (filterText) {
                             root.copyPath(expandPath(filterText))
+                        }
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_C) {
+                        // Copy file (uri-list) for paste (Ctrl+C) — swapped per request
+                        if (displayModel.count>0 && cursorActive) {
+                            var crow = displayModel.get(selectedIndex)
+                            if (crow.path) {
+                                copyFileToClipboard(crow.path, "copy")
+                                root.dismiss()
+                            }
                         }
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_X) {
@@ -1491,7 +1492,7 @@ Item {
                         Text { text: "⌫ parent"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "⎋ close"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "Ctrl+H hidden"; color: root.foreground; opacity: showHidden ? 0.45 : 0.25; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                        Text { text: "Ctrl+C copy path"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                        Text { text: "Ctrl+C copy"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "Ctrl+X cut"; color: root.foreground; opacity: clipboardOp==="cut" ? 0.7 : 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "Ctrl+V paste"; color: root.foreground; opacity: clipboardPath ? 0.65 : 0.25; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                     }
@@ -1519,7 +1520,7 @@ Item {
                     Row {
                         anchors.centerIn: parent
                         spacing: Style.space(10)
-                        Text { text: "Ctrl+Shift+C copy file"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
+                        Text { text: "Ctrl+Shift+C copy path"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
                         Text { text: "Ctrl+Shift+O open with"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
                         Text { text: "Ctrl+T term"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
                         Text { text: "Ctrl+O reveal"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
