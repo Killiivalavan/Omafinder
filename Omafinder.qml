@@ -1583,15 +1583,15 @@ Item {
                     id: trashConfirm
                     anchors.fill: parent
                     opened: trashConfirmOpen
-                    z: 10
+                    z: 20
                     message: trashTarget ? ("Move “" + String(trashTarget.name||"") + "” to Trash?\nRecoverable in Trash.") : "Move to Trash?"
                     confirmText: "Move to Trash"
                     cancelText: "Cancel"
-                    background: root.background
-                    foreground: root.foreground
-                    scrim: root.scrim
-                    selectedBackground: root.selectedBackground
-                    selectedText: root.selectedText
+                    background: Color.menu.background
+                    foreground: Color.menu.text
+                    scrim: Util.alpha(Color.menu.background, 0.85)
+                    selectedBackground: Color.menu.selectedBackground
+                    selectedText: Color.menu.selectedText
                     fontFamily: root.fontFamily
                     cornerRadius: root.cornerRadius
                     onCanceled: cancelTrashConfirm()
