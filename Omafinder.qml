@@ -37,6 +37,13 @@ Item {
     property bool openWithMode: false
     property string openWithFile: ""
     readonly property var appLibrary: shell && shell.appLibrary ? shell.appLibrary : null
+    // Icon cache for files (path -> iconName) to avoid repeated gio calls
+    property var iconCache: ({})
+    property var mimeCache: ({}) // path -> mimetype
+    // For Open With mime filtering
+    property string openWithMime: ""
+    property var openWithRecommendedIds: []
+    property var openWithAllIds: []
 
     // Colors / style — mirror menu tokens
     property color background: Color.menu.background
@@ -216,6 +223,45 @@ Item {
     function isHiddenName(name) {
         return String(name||"").charAt(0) === "."
     }
+    function mimeForPath(path, isDir) {
+        if (isDir) return "inode/directory"
+        var n = String(path||"")
+        var dot = n.lastIndexOf(".")
+        if (dot === -1) return "application/octet-stream"
+        var ext = n.slice(dot+1).toLowerCase()
+        var map = {
+            "py": "text/x-python", "js": "application/javascript", "ts": "application/x-typescript",
+            "tsx": "application/x-typescript", "jsx": "application/javascript", "json": "application/json",
+            "html": "text/html", "css": "text/css", "md": "text/markdown", "txt": "text/plain",
+            "pdf": "application/pdf", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "gif": "image/gif", "svg": "image/svg+xml", "mp4": "video/mp4", "mp3": "audio/mpeg",
+            "zip": "application/zip", "tar": "application/x-tar", "gz": "application/gzip",
+            "rs": "text/x-rust", "go": "text/x-go", "c": "text/x-csrc", "cpp": "text/x-c++src",
+            "h": "text/x-chdr", "java": "text/x-java", "rb": "text/x-ruby", "sh": "application/x-shellscript",
+            "toml": "text/plain", "yaml": "text/x-yaml", "yml": "text/x-yaml", "xml": "application/xml",
+            "csv": "text/csv", "log": "text/plain", "conf": "text/plain", "cfg": "text/plain"
+        }
+        return map[ext] || "application/octet-stream"
+    }
+    function iconForPath(path, isDir) {
+        if (isDir) return "folder"
+        var n = String(path||"")
+        var dot = n.lastIndexOf(".")
+        if (dot === -1) return "text-x-generic"
+        var ext = n.slice(dot+1).toLowerCase()
+        var map = {
+            "py": "text-x-python", "js": "text-x-javascript", "ts": "text-x-javascript",
+            "json": "application-json", "html": "text-html", "css": "text-css",
+            "md": "text-x-generic", "txt": "text-x-generic", "pdf": "application-pdf",
+            "png": "image-x-generic", "jpg": "image-x-generic", "jpeg": "image-x-generic",
+            "gif": "image-x-generic", "svg": "image-x-generic", "mp4": "video-x-generic",
+            "mp3": "audio-x-generic", "zip": "application-x-zip", "tar": "application-x-archive",
+            "gz": "application-x-archive", "rs": "text-x-rust", "go": "text-x-go",
+            "c": "text-x-c", "cpp": "text-x-c++", "h": "text-x-chdr", "sh": "application-x-shellscript",
+            "toml": "text-x-generic", "yaml": "text-x-generic", "yml": "text-x-generic"
+        }
+        return map[ext] || "text-x-generic"
+    }
 
     // ---- Frecency ----
     function bumpFrecency(path) {
@@ -313,7 +359,7 @@ Item {
         isSearching = true
         // Show transient searching state
         displayModel.clear()
-        displayModel.append({name:"Searching…", path:"", isDir:false, detail:"", hidden:false})
+        displayModel.append({name:"Searching…", path:"", isDir:false, detail:"", hidden:false, iconName: "system-search"})
         cursorActive = false
         var quotedHome = Util.shellQuote(home)
         var quotedPattern = Util.shellQuote(q)
@@ -350,7 +396,7 @@ Item {
                 })
                 for (var fbi=0; fbi<fallback.length && fbi<30; fbi++){
                     var fe = fallback[fbi]
-                    displayModel.append({name: fe.name + (fe.isDir?"/":""), path: fe.path, isDir: fe.isDir, detail: tildeCollapse(fe.path), hidden: fe.hidden})
+                    displayModel.append({name: fe.name + (fe.isDir?"/":""), path: fe.path, isDir: fe.isDir, detail: tildeCollapse(fe.path), hidden: fe.hidden, iconName: iconForPath(fe.path, fe.isDir)})
                 }
                 if (displayModel.count===0) {
                     // keep empty, rebuildDisplay will show "No results"
@@ -413,7 +459,7 @@ Item {
                     dname += "/"
                     if (spath.charAt(spath.length-1) !== "/") spath += "/"
                 }
-                displayModel.append({name: dname, path: spath, isDir: isDirFlag, detail: tildeCollapse(spath), hidden: isHiddenName(Fuzzy.basename(spath))})
+                displayModel.append({name: dname, path: spath, isDir: isDirFlag, detail: tildeCollapse(spath), hidden: isHiddenName(Fuzzy.basename(spath)), iconName: iconForPath(spath, isDirFlag)})
             }
             layoutSerial++
             if (displayModel.count===0) { selectedIndex=0; cursorActive=false }
@@ -480,14 +526,13 @@ Item {
                         path: fe.path,
                         isDir: fe.isDir,
                         detail: tildeCollapse(fe.path),
-                        hidden: fe.hidden
-                    })
+                        hidden: fe.hidden, iconName: iconForPath(fe.path, fe.isDir)})
                 }
                 if (displayModel.count===0 && !isSearching) {
-                    displayModel.append({name:"No match", path:"", isDir:false, detail:"Try a different prefix or check hidden (Ctrl+H)", hidden:false})
+                    displayModel.append({name:"No match", path:"", isDir:false, detail:"Try a different prefix or check hidden (Ctrl+H)", hidden:false, iconName: "dialog-information"})
                 }
             } else {
-                displayModel.append({name: Fuzzy.basename(base) + "/", path: normalizeDir(base) + "/", isDir:true, detail: tildeCollapse(normalizeDir(base)), hidden:false})
+                displayModel.append({name: Fuzzy.basename(base) + "/", path: normalizeDir(base) + "/", isDir:true, detail: tildeCollapse(normalizeDir(base)), hidden:false, iconName: "folder"})
             }
             layoutSerial += 1
             if (displayModel.count>0) { selectedIndex = Math.min(selectedIndex, displayModel.count-1); cursorActive=true } else { selectedIndex=0; cursorActive=false }
@@ -510,8 +555,7 @@ Item {
                     path: be.path,
                     isDir: be.isDir,
                     detail: be.isDir ? "" : tildeCollapse(be.path),
-                    hidden: be.hidden
-                })
+                    hidden: be.hidden, iconName: iconForPath(be.path, be.isDir)})
             }
         } else {
             // Small query (<2 chars) or non-path fuzzy on current dir only (no global)
@@ -529,9 +573,9 @@ Item {
                 })
                 for (var sfi=0; sfi<smallFiltered.length && sfi<50; sfi++){
                     var sfe = smallFiltered[sfi]
-                    displayModel.append({name: sfe.name + (sfe.isDir?"/":""), path: sfe.path, isDir: sfe.isDir, detail: tildeCollapse(sfe.path), hidden: sfe.hidden})
+                    displayModel.append({name: sfe.name + (sfe.isDir?"/":""), path: sfe.path, isDir: sfe.isDir, detail: tildeCollapse(sfe.path), hidden: sfe.hidden, iconName: iconForPath(sfe.path, sfe.isDir)})
                 }
-                if (displayModel.count===0) displayModel.append({name:"No results", path:"", isDir:false, detail:'Type more characters for global search', hidden:false})
+                if (displayModel.count===0) displayModel.append({name:"No results", path:"", isDir:false, detail:'Type more characters for global search', hidden:false, iconName: "dialog-information"})
             } else {
                 // For longer queries, we should have triggered search via debounce - but if we are here without search, fallback to local fuzzy
                 var localFiltered = []
@@ -547,14 +591,14 @@ Item {
                 })
                 for (var lfi=0; lfi<localFiltered.length && lfi<50; lfi++){
                     var lfe = localFiltered[lfi]
-                    displayModel.append({name: lfe.name + (lfe.isDir?"/":""), path: lfe.path, isDir: lfe.isDir, detail: tildeCollapse(lfe.path), hidden: lfe.hidden})
+                    displayModel.append({name: lfe.name + (lfe.isDir?"/":""), path: lfe.path, isDir: lfe.isDir, detail: tildeCollapse(lfe.path), hidden: lfe.hidden, iconName: iconForPath(lfe.path, lfe.isDir)})
                 }
                 // If no local results, trigger global search now (if not already)
                 if (displayModel.count===0) {
                     pendingSearchQuery = q
                     searchDebounce.restart()
                     displayModel.clear()
-                    displayModel.append({name:"Searching…", path:"", isDir:false, detail:"", hidden:false})
+                    displayModel.append({name:"Searching…", path:"", isDir:false, detail:"", hidden:false, iconName: "system-search"})
                     cursorActive=false
                 }
             }
@@ -949,18 +993,65 @@ Item {
     function enterOpenWithMode(path) {
         var p = String(path||"")
         if (!p) return
-        // Check if it's a file (not dir)
         openWithFile = p
         openWithMode = true
         filterText = ""
         selectedIndex = 0
         cursorActive = true
-        // Clear any pending search
         if (searchProc.running) searchProc.running = false
         searchDebounce.stop()
         isSearching = false
-        rebuildAppDisplay()
+        // Determine mime for filtering — use extension map, fallback to gio if needed
+        var isDir = p.charAt(p.length-1) === "/" || false
+        // Try to infer isDir via dirEntries if available
+        for (var di=0; di<dirEntries.length; di++) if (dirEntries[di].path === p) { isDir = dirEntries[di].isDir; break }
+        openWithMime = mimeForPath(p, isDir)
+        // For folders, ensure we include known editors even if not in mime DB
+        openWithRecommendedIds = []
+        openWithAllIds = []
+        // Async fetch recommended/all ids via gio mime — will call rebuildAppDisplay on exit
+        var mtypeQ = Util.shellQuote(openWithMime)
+        var cmd = "mtype=" + mtypeQ + "; "
+        cmd += "echo \"__MIME__$mtype\"; "
+        cmd += "gio mime \"$mtype\" 2>/dev/null | grep -E \"\\.desktop\" | sed 's/^[[:space:]]*//' | head -n 30; "
+        cmd += "echo \"__ALL__\"; "
+        cmd += "grep -l \"MimeType=.*$mtype\" /usr/share/applications/*.desktop /usr/local/share/applications/*.desktop 2>/dev/null | xargs -r -I {} basename {} 2>/dev/null | head -n 50; "
+        // Extra for folders: add known handlers
+        cmd += "if [ \"$mtype\" = \"inode/directory\" ]; then for id in code.desktop dev.zed.Zed.desktop nvim.desktop org.gnome.TextEditor.desktop codium.desktop; do echo \"$id\"; done; fi"
+        openWithAppsProc.command = ["bash","-lc", cmd]
+        openWithAppsProc.running = true
+        // Show loading immediately
+        displayModel.clear()
+        displayModel.append({name:"Loading apps for " + openWithMime + "…", path:"", isDir:false, detail:"", hidden:false, iconName: "system-search", appIcon: "", appId: ""})
         Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
+    }
+    Process {
+        id: openWithAppsProc
+        stdout: StdioCollector { id: openWithAppsOutput; waitForEnd: true }
+        onExited: function(code){
+            var raw = String(openWithAppsOutput.text||"")
+            var lines = raw.split("\n")
+            var mode = "rec"
+            var rec = [], all = []
+            var seenRec = {}, seenAll = {}
+            for (var i=0;i<lines.length;i++) {
+                var l = String(lines[i]||"").trim()
+                if (!l) continue
+                if (l.indexOf("__MIME__")===0) continue
+                if (l === "__ALL__") { mode = "all"; continue }
+                if (l.indexOf(".desktop")===-1) continue
+                // Normalize to end with .desktop
+                if (l.slice(-8) !== ".desktop") l = l + ".desktop"
+                if (mode === "rec") {
+                    if (!seenRec[l]) { rec.push(l); seenRec[l]=true; if (!seenAll[l]) { all.push(l); seenAll[l]=true } }
+                } else {
+                    if (!seenAll[l]) { all.push(l); seenAll[l]=true }
+                }
+            }
+            openWithRecommendedIds = rec
+            openWithAllIds = all
+            rebuildAppDisplay()
+        }
     }
     function exitOpenWithMode() {
         openWithMode = false
@@ -1013,13 +1104,41 @@ Item {
             return
         }
         var q = String(filterText||"").trim().toLowerCase()
+        // If we have mime-filtered ids (recommended + all for type), use them
+        var mimeFilterActive = openWithMime !== "" && openWithAllIds.length > 0
+        var recommendedSet = {}
+        var allSet = {}
+        if (mimeFilterActive) {
+            for (var ri=0; ri<openWithRecommendedIds.length; ri++) {
+                var rid = String(openWithRecommendedIds[ri]||"")
+                if (rid.slice(-8) !== ".desktop") rid += ".desktop"
+                recommendedSet[rid] = true
+                allSet[rid] = true
+                // also without extension
+                recommendedSet[rid.slice(0,-8)] = true
+                allSet[rid.slice(0,-8)] = true
+            }
+            for (var ai=0; ai<openWithAllIds.length; ai++) {
+                var aid = String(openWithAllIds[ai]||"")
+                if (aid.slice(-8) !== ".desktop") aid += ".desktop"
+                allSet[aid] = true
+                allSet[aid.slice(0,-8)] = true
+            }
+        }
         var entries
         try { entries = lib.sortedEntries(q) } catch(e) { entries = [] }
-        var limit = 100
-        var added = 0
-        for (var i=0; i<entries.length && added < limit; i++) {
+        // If mime filter is active but no entries match after filter, we will collect and then sort with recommended boost
+        var candidates = []
+        for (var i=0; i<entries.length; i++) {
             var e = entries[i].entry
             if (!e || !e.id) continue
+            var idStr = String(e.id||"")
+            // Mime filtering: only keep apps that handle this mime (recommended + all for type)
+            if (mimeFilterActive) {
+                var withExt = idStr.slice(-8) === ".desktop" ? idStr : idStr + ".desktop"
+                var withoutExt = idStr.slice(-8) === ".desktop" ? idStr.slice(0,-8) : idStr
+                if (!allSet[withExt] && !allSet[withoutExt] && !allSet[idStr]) continue
+            }
             var label
             try { label = lib.entryName(e) } catch(ee) { label = String(e.id||"") }
             var detail
@@ -1027,14 +1146,33 @@ Item {
             if (q && label.toLowerCase().indexOf(q)===-1 && detail.toLowerCase().indexOf(q)===-1) {
                 if (Fuzzy.fuzzyScore(q, label) < 0 && Fuzzy.fuzzyScore(q, detail) < 0) continue
             }
+            var score = 0
+            if (mimeFilterActive) {
+                var checkId = idStr.slice(-8) === ".desktop" ? idStr : idStr + ".desktop"
+                var checkId2 = idStr.slice(-8) === ".desktop" ? idStr.slice(0,-8) : idStr
+                if (recommendedSet[checkId] || recommendedSet[checkId2] || recommendedSet[idStr]) score += 100
+            }
+            // Add fuzzy score for sorting
+            if (q) score += Math.max(0, Fuzzy.fuzzyScore(q, label))
+            candidates.push({entry: e, label: label, detail: detail, score: score})
+        }
+        candidates.sort(function(a,b){
+            if (b.score !== a.score) return b.score - a.score
+            return String(a.label).localeCompare(String(b.label))
+        })
+        var limit = 100
+        var added = 0
+        for (var ci=0; ci<candidates.length && added < limit; ci++) {
+            var c = candidates[ci]
+            var e2 = c.entry
             displayModel.append({
-                name: label,
-                path: String(e.id||""),
+                name: c.label,
+                path: String(e2.id||""),
                 isDir: false,
-                detail: detail,
+                detail: c.detail,
                 hidden: false,
-                appIcon: String(e.icon||""),
-                appId: String(e.id||"")
+                appIcon: String(e2.icon||""),
+                appId: String(e2.id||"")
             })
             added++
         }
@@ -1401,8 +1539,10 @@ Item {
                             required property bool hidden
                             property string appIcon: ""
                             property string appId: ""
+                            property string iconName: ""
                             readonly property bool hasCursor: root.cursorActive && row.index === root.selectedIndex
                             readonly property bool isApp: openWithMode && appId !== ""
+                            readonly property bool hasFileIcon: !isApp && iconName !== ""
                             width: ListView.view.width
                             height: root.rowHeight
                             radius: root.cornerRadius
@@ -1417,8 +1557,9 @@ Item {
                                 anchors.bottomMargin: Style.space(6)
                                 spacing: Style.space(10)
 
-                                // Icon — app icon when in Open With, else folder/file
+                                // Icon — app icon when in Open With, else file icon via iconName, fallback to emoji
                                 Image {
+                                    id: appIconImage
                                     visible: row.isApp && row.appIcon !== ""
                                     width: Style.space(28)
                                     height: Style.space(28)
@@ -1429,8 +1570,21 @@ Item {
                                     asynchronous: true
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
+                                Image {
+                                    id: fileIconImage
+                                    visible: !row.isApp && row.iconName !== ""
+                                    width: Style.space(28)
+                                    height: Style.space(28)
+                                    source: visible ? Quickshell.iconPath(row.iconName, true) : ""
+                                    fillMode: Image.PreserveAspectFit
+                                    sourceSize.width: width * Screen.devicePixelRatio
+                                    sourceSize.height: height * Screen.devicePixelRatio
+                                    asynchronous: true
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    onStatusChanged: if (status === Image.Error) visible = false
+                                }
                                 Text {
-                                    visible: !row.isApp || row.appIcon === ""
+                                    visible: !appIconImage.visible && !fileIconImage.visible
                                     textFormat: Text.PlainText
                                     text: row.isDir ? "📁" : (row.hidden ? "·" : "📄")
                                     color: row.hasCursor ? root.selectedText : root.foreground
