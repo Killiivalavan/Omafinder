@@ -1199,15 +1199,24 @@ Item {
     function launchAppWithFile(desktopId, filePath) {
         var did = String(desktopId||"").trim()
         var fp = String(filePath||"").trim()
-        if (!did || !fp) return
-        // Normalize desktopId: remove .desktop suffix if present for gtk-launch
+        if (!did || !fp) {
+            console.warn("Omafinder: launchAppWithFile missing args did=" + did + " fp=" + fp)
+            return
+        }
         if (did.slice(-8) === ".desktop") did = did.slice(0,-8)
+        var desktopFile = did + ".desktop"
         bumpFrecency(fp)
-        // Launch via uwsm-app + gtk-launch, same as AppLibrary.launch but with file arg
-        var cmd = "uwsm-app -- gtk-launch " + Util.shellQuote(did + ".desktop") + " " + Util.shellQuote(fp) + " >/dev/null 2>&1 &"
-        // Fallback: try gio launch
-        var fallback = "gio launch " + Util.shellQuote(did + ".desktop") + " " + Util.shellQuote(fp) + " >/dev/null 2>&1 &"
-        Util.execDetached(cmd + " || " + fallback)
+        console.log("Omafinder: launching " + desktopFile + " with " + fp)
+        var qDesktop = Util.shellQuote(desktopFile)
+        var qFile = Util.shellQuote(fp)
+        // Build a single bash chain without stray & before || — execDetached already backgrounds
+        var cmd = ""
+        cmd += "uwsm-app -- gtk-launch " + qDesktop + " " + qFile + " >/dev/null 2>&1; ec=$?; [ $ec -eq 0 ] && exit 0; "
+        cmd += "gtk-launch " + qDesktop + " " + qFile + " >/dev/null 2>&1; ec=$?; [ $ec -eq 0 ] && exit 0; "
+        cmd += "for d in /usr/share/applications /usr/local/share/applications $HOME/.local/share/applications; do [ -f \"$d/" + desktopFile + "\" ] && { gio launch \"$d/" + desktopFile + "\" " + qFile + " >/dev/null 2>&1; ec=$?; [ $ec -eq 0 ] && exit 0; }; done; "
+        cmd += "handlr launch --with=" + qDesktop + " " + qFile + " >/dev/null 2>&1; ec=$?; [ $ec -eq 0 ] && exit 0; "
+        cmd += "echo \"Omafinder: launch failed for " + desktopFile + " with " + fp.replace(/"/g, '\\"') + "\" >> /tmp/omafinder_launch.log 2>&1; exit 1"
+        Util.execDetached(cmd)
         openWithMode = false
         openWithFile = ""
         root.dismiss()
