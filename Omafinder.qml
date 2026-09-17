@@ -1068,18 +1068,33 @@ Item {
         console.log("Omafinder: rebuildAppDisplay openWithMode=" + openWithMode + " mime=" + openWithMime + " allIds=" + openWithAllIds.length + " rec=" + openWithRecommendedIds.length + " q=" + filterText + " lib=" + (appLibrary ? "ok" : (shell && shell.appLibrary ? "shellLib" : "null")))
         displayModel.clear()
         var lib = appLibrary || (shell && shell.appLibrary ? shell.appLibrary : null)
+        // Build recommended set early for fallback path as well
+        var qEarly = String(filterText||"").trim().toLowerCase()
+        var recSetEarly = {}
+        var hasRecEarly = false
+        if (openWithMode && openWithMime !== "" && openWithRecommendedIds.length > 0) {
+            hasRecEarly = true
+            for (var re=0; re<openWithRecommendedIds.length; re++) {
+                var ridE = String(openWithRecommendedIds[re]||"")
+                if (ridE.slice(-8) !== ".desktop") ridE += ".desktop"
+                recSetEarly[ridE] = true; recSetEarly[ridE.slice(0,-8)] = true
+                recSetEarly[String(openWithRecommendedIds[re]||"")] = true
+            }
+        }
         if (!lib) {
-            // Extra fallback: try global DesktopEntries via Quickshell if available
+            // Fallback via DesktopEntries — but still respect Recommended filter
             try {
                 if (typeof DesktopEntries !== "undefined" && DesktopEntries.applications) {
                     var vals = DesktopEntries.applications.values || []
                     if (vals.length > 0) {
-                        // Build minimal lib-like interface from DesktopEntries
                         var q2 = String(filterText||"").trim().toLowerCase()
                         var filtered = []
                         for (var vi=0; vi<vals.length; vi++) {
                             var de = vals[vi]
                             var id = String(de.id||"")
+                            var withExt = id.slice(-8) === ".desktop" ? id : id + ".desktop"
+                            var withoutExt = id.slice(-8) === ".desktop" ? id.slice(0,-8) : id
+                            if (hasRecEarly && !recSetEarly[withExt] && !recSetEarly[withoutExt] && !recSetEarly[id]) continue
                             var name = String(de.name||id)
                             if (q2 && name.toLowerCase().indexOf(q2)===-1 && id.toLowerCase().indexOf(q2)===-1) {
                                 if (Fuzzy.fuzzyScore(q2, name) < 0 && Fuzzy.fuzzyScore(q2, id) < 0) continue
@@ -1100,6 +1115,11 @@ Item {
                             })
                         }
                         if (displayModel.count>0) { selectedIndex=0; cursorActive=true; layoutSerial++; Qt.callLater(function(){ resultList.positionViewAtIndex(0, ListView.Contain) }); return }
+                        // If filtered empty but we had rec, show empty, not all
+                        if (hasRecEarly) {
+                            displayModel.append({name:"No apps for “" + filterText + "”", path:"", isDir:false, detail:"No recommended handler for " + openWithMime, hidden:false})
+                            selectedIndex=0; cursorActive=false; layoutSerial++; return
+                        }
                     }
                 }
             } catch(e) {}
