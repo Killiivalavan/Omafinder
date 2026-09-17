@@ -1013,11 +1013,11 @@ Item {
         var mtypeQ = Util.shellQuote(openWithMime)
         var cmd = "mtype=" + mtypeQ + "; "
         cmd += "echo \"__MIME__$mtype\"; "
-        cmd += "gio mime \"$mtype\" 2>/dev/null | grep -E \"\\.desktop\" | sed 's/^[[:space:]]*//' | head -n 30; "
+        cmd += "gio mime \"$mtype\" 2>/dev/null | grep -oE \"[^[:space:]]+\\.desktop\" | sort -u | head -n 30; "
         cmd += "echo \"__ALL__\"; "
-        cmd += "grep -l \"MimeType=.*$mtype\" /usr/share/applications/*.desktop /usr/local/share/applications/*.desktop 2>/dev/null | xargs -r -I {} basename {} 2>/dev/null | head -n 50; "
-        // Extra for folders: add known handlers
-        cmd += "if [ \"$mtype\" = \"inode/directory\" ]; then for id in code.desktop dev.zed.Zed.desktop nvim.desktop org.gnome.TextEditor.desktop codium.desktop; do echo \"$id\"; done; fi"
+        cmd += "grep -l \"MimeType=.*$mtype\" /usr/share/applications/*.desktop /usr/local/share/applications/*.desktop 2>/dev/null | xargs -r -I {} basename {} 2>/dev/null | sort -u | head -n 50; "
+        // Extra for folders: add known handlers (strict)
+        cmd += "if [ \"$mtype\" = \"inode/directory\" ]; then for id in org.gnome.Nautilus.desktop code.desktop dev.zed.Zed.desktop nvim.desktop org.gnome.TextEditor.desktop codium.desktop; do echo \"$id\"; done | sort -u; fi"
         openWithAppsProc.command = ["bash","-lc", cmd]
         openWithAppsProc.running = true
         // Show loading immediately
@@ -1104,8 +1104,18 @@ Item {
             return
         }
         var q = String(filterText||"").trim().toLowerCase()
-        // If we have mime-filtered ids (recommended + all for type), use them
-        var mimeFilterActive = openWithMime !== "" && openWithAllIds.length > 0
+        // Strict mime filtering: when in Open With, only show handlers for that mime (recommended + all for type)
+        // If we are still loading (proc running and no ids yet), keep loading display
+        if (openWithMode && openWithMime !== "" && openWithAllIds.length === 0 && openWithAppsProc.running) {
+            return // keep "Loading…" shown by enterOpenWithMode
+        }
+        var mimeFilterActive = openWithMode && openWithMime !== ""
+        // If strict but no handlers found, show no apps (not all)
+        if (mimeFilterActive && openWithAllIds.length === 0) {
+            displayModel.clear()
+            displayModel.append({name:"No handlers for “" + openWithMime + "”", path:"", isDir:false, detail:"No apps declare support for this file type", hidden:false, iconName: "dialog-information", appIcon: "", appId: ""})
+            selectedIndex=0; cursorActive=false; layoutSerial++; return
+        }
         var recommendedSet = {}
         var allSet = {}
         if (mimeFilterActive) {
