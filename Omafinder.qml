@@ -1589,7 +1589,7 @@ Item {
                     cancelText: "Cancel"
                     background: Color.menu.background
                     foreground: Color.menu.text
-                    scrim: Util.alpha(Color.menu.background, 0.5)
+                    scrim: Util.alpha(Color.menu.background, 0.6)
                     selectedBackground: Color.menu.selectedBackground
                     selectedText: Color.menu.selectedText
                     fontFamily: root.fontFamily
