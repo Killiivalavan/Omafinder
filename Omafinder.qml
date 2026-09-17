@@ -1013,10 +1013,13 @@ Item {
         var mtypeQ = Util.shellQuote(openWithMime)
         var cmd = "mtype=" + mtypeQ + "; "
         cmd += "echo \"__MIME__$mtype\"; "
+        // Recommended from gio mime
         cmd += "gio mime \"$mtype\" 2>/dev/null | grep -oE \"[^[:space:]]+\\.desktop\" | sort -u | head -n 30; "
+        // For folders, add known editors as recommended too
+        cmd += "if [ \"$mtype\" = \"inode/directory\" ]; then for id in org.gnome.Nautilus.desktop code.desktop dev.zed.Zed.desktop nvim.desktop org.gnome.TextEditor.desktop codium.desktop; do echo \"$id\"; done | sort -u; fi; "
         cmd += "echo \"__ALL__\"; "
         cmd += "grep -l \"MimeType=.*$mtype\" /usr/share/applications/*.desktop /usr/local/share/applications/*.desktop 2>/dev/null | xargs -r -I {} basename {} 2>/dev/null | sort -u | head -n 50; "
-        // Extra for folders: add known handlers (strict)
+        // Also add folder handlers to all for completeness
         cmd += "if [ \"$mtype\" = \"inode/directory\" ]; then for id in org.gnome.Nautilus.desktop code.desktop dev.zed.Zed.desktop nvim.desktop org.gnome.TextEditor.desktop codium.desktop; do echo \"$id\"; done | sort -u; fi"
         openWithAppsProc.command = ["bash","-lc", cmd]
         openWithAppsProc.running = true
@@ -1138,17 +1141,17 @@ Item {
         }
         var entries
         try { entries = lib.sortedEntries(q) } catch(e) { entries = [] }
-        // If mime filter is active but no entries match after filter, we will collect and then sort with recommended boost
+        // Recommended-only filtering: only show apps in recommendedSet (gio mime)
         var candidates = []
         for (var i=0; i<entries.length; i++) {
             var e = entries[i].entry
             if (!e || !e.id) continue
             var idStr = String(e.id||"")
-            // Mime filtering: only keep apps that handle this mime (recommended + all for type)
+            // Mime filtering: only keep apps in Recommended (strict)
             if (mimeFilterActive) {
                 var withExt = idStr.slice(-8) === ".desktop" ? idStr : idStr + ".desktop"
                 var withoutExt = idStr.slice(-8) === ".desktop" ? idStr.slice(0,-8) : idStr
-                if (!allSet[withExt] && !allSet[withoutExt] && !allSet[idStr]) continue
+                if (!recommendedSet[withExt] && !recommendedSet[withoutExt] && !recommendedSet[idStr]) continue
             }
             var label
             try { label = lib.entryName(e) } catch(ee) { label = String(e.id||"") }
@@ -1158,12 +1161,7 @@ Item {
                 if (Fuzzy.fuzzyScore(q, label) < 0 && Fuzzy.fuzzyScore(q, detail) < 0) continue
             }
             var score = 0
-            if (mimeFilterActive) {
-                var checkId = idStr.slice(-8) === ".desktop" ? idStr : idStr + ".desktop"
-                var checkId2 = idStr.slice(-8) === ".desktop" ? idStr.slice(0,-8) : idStr
-                if (recommendedSet[checkId] || recommendedSet[checkId2] || recommendedSet[idStr]) score += 100
-            }
-            // Add fuzzy score for sorting
+            // Recommended already filtered, no extra boost needed but keep for sorting
             if (q) score += Math.max(0, Fuzzy.fuzzyScore(q, label))
             candidates.push({entry: e, label: label, detail: detail, score: score})
         }
