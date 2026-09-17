@@ -972,27 +972,64 @@ Item {
     }
     function rebuildAppDisplay() {
         displayModel.clear()
-        if (!appLibrary) {
-            displayModel.append({name:"No apps found", path:"", isDir:false, detail:"AppLibrary not available", hidden:false})
+        var lib = appLibrary || (shell && shell.appLibrary ? shell.appLibrary : null)
+        if (!lib) {
+            // Extra fallback: try global DesktopEntries via Quickshell if available
+            try {
+                if (typeof DesktopEntries !== "undefined" && DesktopEntries.applications) {
+                    var vals = DesktopEntries.applications.values || []
+                    if (vals.length > 0) {
+                        // Build minimal lib-like interface from DesktopEntries
+                        var q2 = String(filterText||"").trim().toLowerCase()
+                        var filtered = []
+                        for (var vi=0; vi<vals.length; vi++) {
+                            var de = vals[vi]
+                            var id = String(de.id||"")
+                            var name = String(de.name||id)
+                            if (q2 && name.toLowerCase().indexOf(q2)===-1 && id.toLowerCase().indexOf(q2)===-1) {
+                                if (Fuzzy.fuzzyScore(q2, name) < 0 && Fuzzy.fuzzyScore(q2, id) < 0) continue
+                            }
+                            filtered.push({entry: de, label: name})
+                        }
+                        filtered.sort(function(a,b){ return String(a.label).localeCompare(String(b.label)) })
+                        for (var fi2=0; fi2<Math.min(filtered.length,100); fi2++) {
+                            var fe = filtered[fi2].entry
+                            displayModel.append({
+                                name: String(fe.name||fe.id||""),
+                                path: String(fe.id||""),
+                                isDir: false,
+                                detail: String(fe.comment||fe.id||""),
+                                hidden: false,
+                                appIcon: String(fe.icon||""),
+                                appId: String(fe.id||"")
+                            })
+                        }
+                        if (displayModel.count>0) { selectedIndex=0; cursorActive=true; layoutSerial++; Qt.callLater(function(){ resultList.positionViewAtIndex(0, ListView.Contain) }); return }
+                    }
+                }
+            } catch(e) {}
+            displayModel.append({name:"No apps found", path:"", isDir:false, detail:"AppLibrary not available" + (shell ? " (shell ok, lib null)" : " (shell null)"), hidden:false})
+            console.warn("Omafinder: appLibrary unavailable — shell=" + (shell ? "present" : "null") + " appLibrary prop=" + appLibrary)
             return
         }
         var q = String(filterText||"").trim().toLowerCase()
-        var entries = appLibrary.sortedEntries(q) // already filtered/sorted by AppSearch
-        // AppSearch already does fuzzy, but we add our own filter for consistency when q empty
+        var entries
+        try { entries = lib.sortedEntries(q) } catch(e) { entries = [] }
         var limit = 100
         var added = 0
         for (var i=0; i<entries.length && added < limit; i++) {
             var e = entries[i].entry
             if (!e || !e.id) continue
-            var label = appLibrary.entryName(e)
-            var detail = appLibrary.entrySubtext(e) || String(e.id||"")
-            // Additional fuzzy filter if needed (AppSearch already filtered, but keep)
+            var label
+            try { label = lib.entryName(e) } catch(ee) { label = String(e.id||"") }
+            var detail
+            try { detail = lib.entrySubtext(e) || String(e.id||"") } catch(ee2) { detail = String(e.id||"") }
             if (q && label.toLowerCase().indexOf(q)===-1 && detail.toLowerCase().indexOf(q)===-1) {
                 if (Fuzzy.fuzzyScore(q, label) < 0 && Fuzzy.fuzzyScore(q, detail) < 0) continue
             }
             displayModel.append({
                 name: label,
-                path: String(e.id||""), // store desktopId in path
+                path: String(e.id||""),
                 isDir: false,
                 detail: detail,
                 hidden: false,
@@ -1164,10 +1201,15 @@ Item {
                         pasteClipboard()
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_O) {
-                        // Open With
+                        // Open With — now works for both files and folders (e.g., Zed on project dir)
                         if (displayModel.count>0 && cursorActive) {
                             var orow = displayModel.get(selectedIndex)
-                            if (orow.path && !orow.isDir) enterOpenWithMode(orow.path)
+                            if (orow.path) enterOpenWithMode(orow.path)
+                        } else if (!displayModel.count || !cursorActive) {
+                            // No selection — try currentDir or filterText as folder
+                            var fallback = currentDir
+                            if (filterText && Fuzzy.isPathLike(filterText)) fallback = expandPath(filterText)
+                            enterOpenWithMode(fallback)
                         }
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_T) {
