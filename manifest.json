@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "omafinder",
+  "name": "Omafinder",
+  "version": "0.1.0",
+  "author": "local",
+  "description": "Transient, keyboard-first filesystem navigator — summon, locate, act, disappear",
+  "kinds": ["overlay"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Omafinder.qml"
+  }
+}
