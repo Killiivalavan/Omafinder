@@ -38,14 +38,20 @@ Inspired by the Omarchy Transient Filesystem Navigator spec.
 
 ### Secondary actions (included)
 
-Secondary, but still transient — must preserve “disappear after completion”:
+Secondary, and still transient — the overlay goes away once the task is done, except copy/cut which keep the overlay open (jumping to `~` so the paste can follow immediately):
 
-* `Ctrl+C` — Copy path (`wl-copy` / `xclip` fallback)
-* `Ctrl+T` — Terminal here (`omarchy launch terminal` → `foot`/`alacritty`/`kitty` fallback)
+* `Ctrl+C` — Copy file (`wl-copy` uri-list / `xclip` fallback) → stays open, jumps to `~` for a quick `Ctrl+V` paste
+* `Ctrl+X` — Cut file → stays open, jumps to `~` for paste
+* `Ctrl+V` — Paste copied/cut item into the current folder (`gio` / `cp` fallback)
+* `Ctrl+Shift+C` — Copy absolute path (`wl-copy` / `xclip` fallback)
+* `Ctrl+D` — Trash with confirm dialog (`gio trash`); `Delete` routes through the same confirm
+* `F2` — Rename selected file/folder (inline dialog, `Enter` confirms, `Esc` cancels, conflicts error in dialog)
+* `Ctrl+T` — Terminal here (`xdg-terminal-exec --dir` → `foot`/`alacritty`/`kitty`/`ghostty` fallback); folder → that folder, file → its directory
+* `Ctrl+Shift+O` — Open With… (mime-filtered app list)
 * `Ctrl+O` — Reveal in file manager (`nautilus --select` or `xdg-open`)
 * `Ctrl+N` — Create folder (“New Folder” with dedup)
-* `Delete` — Trash (`gio trash`)
 * `Enter` on dir → navigate, `Enter` on file → open via `xdg-open` + dismiss
+* `F1` / `Ctrl+/` — Keybindings help popup (lists every binding)
 
 ---
 
@@ -101,7 +107,8 @@ omarchy-shell shell summon omafinder '{}'  # should return ok
 * `Backspace` (empty) → parent
 * `Esc` → dismiss
 * `Ctrl+H` → toggle hidden files
-* Hints shown in footer
+* `F2` → rename selected item · `F1`/`Ctrl+/` → help popup
+* Hints shown in a persistent footer (`F1 / Ctrl+/ help` entry)
 
 ### Path examples
 
@@ -162,8 +169,8 @@ hyprctl binds | grep -i omafinder
 
 * [ ] Config via `shell.json` (`searchRoot`, `width`, `frecency` weight)
 * [ ] Context menu for secondary actions (right-click)
-* [ ] Create/rename inline
-* [ ] Clipboard copy/cut/paste file ops (`wl-copy` uri-list, `gio` move)
+* [x] Create/rename inline
+* [x] Clipboard copy/cut/paste file ops (`wl-copy` uri-list, `gio` move)
 * [ ] File preview for text/images (opt-in)
 * [ ] Keep frecency in separate file for easier backup
 

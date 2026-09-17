@@ -33,7 +33,6 @@ function fuzzyScore(pattern, text) {
             else {
                 var prev = t.charAt(tIdx - 1)
                 if (prev === '/' || prev === '\\' || prev === '_' || prev === '-' || prev === '.' || prev === ' ') score += 8
-                if (prev === prev.toUpperCase && prev !== prev.toLowerCase) {} // camelCase bonus could go here
             }
             // bonus if match is at filename start (after last slash)
             pIdx += 1

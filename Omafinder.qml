@@ -20,7 +20,6 @@ Item {
     property int selectedIndex: 0
     property bool cursorActive: false
     property bool showHidden: true
-    property bool showHiddenPersisted: true
     property var dirEntries: [] // {name, path, isDir, hidden}
     property string pendingSearchQuery: ""
     property bool isSearching: false
@@ -40,9 +39,14 @@ Item {
     // Trash confirm
     property bool trashConfirmOpen: false
     property var trashTarget: null
-    // Icon cache for files (path -> iconName) to avoid repeated gio calls
-    property var iconCache: ({})
-    property var mimeCache: ({}) // path -> mimetype
+    // Help
+    property bool helpOpen: false
+    // Rename
+    property bool renameOpen: false
+    property var renameTarget: null // {path, name, isDir}
+    property string renameText: ""
+    property string renameError: ""
+    property int renameSelected: 1
     // For Open With mime filtering
     property string openWithMime: ""
     property var openWithRecommendedIds: []
@@ -72,8 +76,8 @@ Item {
         if (rows === 0) rows = 1
         var listH = rows * rowHeight + Math.max(0, rows - 1) * rowSpacing
         var total = contentMargin*2 + headerHeight + contentSpacing + listH
-        // Footer: 22 + 18 when not in Open With
-        total += Style.space(22) + (openWithMode ? 0 : Style.space(18))
+        // Single persistent footer — 28 + spacing for breathing room so footer not clipped
+        total += Style.space(28) + Style.spacing.md
         return Math.min(total, panel.height - Style.gapsOut*2)
     }
 
@@ -106,12 +110,24 @@ Item {
         openWithFile = ""
         trashConfirmOpen = false
         trashTarget = null
+        helpOpen = false
+        renameOpen = false
+        renameTarget = null
+        renameError = ""
         if (searchProc.running) searchProc.running = false
         searchDebounce.stop()
         isSearching = false
     }
 
     function dismiss() {
+        if (renameOpen) {
+            cancelRename()
+            return
+        }
+        if (helpOpen) {
+            closeHelp()
+            return
+        }
         if (trashConfirmOpen) {
             cancelTrashConfirm()
             return
@@ -158,7 +174,6 @@ Item {
             if (data.frecency && typeof data.frecency === "object") frecency = data.frecency
             if (typeof data.showHidden === "boolean") {
                 showHidden = data.showHidden
-                showHiddenPersisted = data.showHidden
             }
             stateLoaded = true
         } catch(e) { stateLoaded = true }
@@ -169,29 +184,27 @@ Item {
             frecency: frecency,
             showHidden: showHidden
         }
-        // ensure dir exists
-        stateSaveProc.command = ["bash","-lc", "mkdir -p " + Util.shellQuote(stateDir) + " && cat > " + Util.shellQuote(statePath)]
-        stateSaveProc.input = JSON.stringify(payload, null, 2) + "\n"
-        stateSaveProc.running = true
+        // Atomic write via FileView (temp file + rename) — a crash mid-write
+        // can no longer leave a truncated state.json behind.
+        stateFile.setText(JSON.stringify(payload, null, 2) + "\n")
     }
 
+    // FileView does not create parent dirs — ensure the state dir exists once.
     Process {
-        id: stateSaveProc
-        property string input: ""
-        stdinEnabled: true
-        onStarted: {
-            try { write(input); closeWriteChannel() } catch(e) {}
-        }
+        id: stateDirProc
+        command: ["bash","-lc", "mkdir -p " + Util.shellQuote(stateDir)]
     }
 
     FileView {
         id: stateFile
         path: root.statePath
         watchChanges: false
+        atomicWrites: true
         printErrors: false
         onLoaded: root.loadState(text())
         onLoadFailed: root.stateLoaded = true
     }
+    Component.onCompleted: stateDirProc.running = true
 
     // ---- Path helpers ----
     function tildeCollapse(path) {
@@ -341,6 +354,20 @@ Item {
                 entries.push({name:name, path:full, isDir:isDir, hidden:isHiddenName(name)})
             }
             dirEntries = entries
+            if (pendingRenameSelect) {
+                var want = pendingRenameSelect
+                pendingRenameSelect = ""
+                for (var rs=0; rs<entries.length; rs++) {
+                    if (entries[rs].path === want || normalizeDir(entries[rs].path) === normalizeDir(want)) {
+                        rebuildDisplay()
+                        selectedIndex = rs
+                        cursorActive = true
+                        layoutSerial++
+                        Qt.callLater(function(){ resultList.positionViewAtIndex(selectedIndex, ListView.Contain) })
+                        return
+                    }
+                }
+            }
             if (root.opened && !openWithMode) {
                 // Only rebuild if not in search mode and not in Open With
                 var q = String(filterText||"").trim()
@@ -710,16 +737,8 @@ Item {
         Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
     }
 
-    function resolvePathInput(input) {
-        var s = String(input||"").trim()
-        if (!s) return ""
-        var expanded = expandPath(s)
-        return expanded
-    }
-
     // Check if path is dir via stat (async) then act
     property string pendingActivatePath: ""
-    property bool pendingActivateIsDir: false
 
     function activateIndex(index) {
         if (index<0 || index>=displayModel.count) return
@@ -802,9 +821,7 @@ Item {
                 return
             }
         }
-        // Check if expanded path is absolute and exists as file/dir via quick test: we dispatch pending logic for expanded
-        // We'll do stat for expanded first
-        var testPath = expanded
+        // Check if expanded path exists as file/dir via async stat
         // If q contains no slash and not path-like, but user pressed enter on empty-ish? Use selected row
         if (!Fuzzy.isPathLike(q)) {
             if (displayModel.count>0 && cursorActive) activateIndex(selectedIndex)
@@ -812,8 +829,6 @@ Item {
                 // Try expanded as file in currentDir
                 var tryFile = joinPath(currentDir, q)
                 pendingActivatePath = tryFile
-                var cmd2 = "if [ -d " + Util.shellQuote(tryFile) + " ]; then echo DIR; elif [ -e " + Util.shellQuote(tryFile) + " ]; then echo FILE; elif [ -e " + Util.shellQuote(expanded) + " ]; then echo EXPANDED_FILE; else echo MISSING; fi"
-                // ugly but handle: we will just check expanded via stat
                 statDirectProc.command = ["bash","-lc", "if [ -e " + Util.shellQuote(expanded) + " ] || [ -d " + Util.shellQuote(expanded) + " ]; then if [ -d " + Util.shellQuote(expanded) + " ]; then echo DIR; else echo FILE; fi; else echo MISSING; fi"]
                 statDirectProc.running = true
                 // store q for fallback
@@ -883,22 +898,19 @@ Item {
     }
     function copyFile(path) {
         copyFileToClipboard(path, "copy")
-        // Copy should keep overlay open briefly? Spec says dismiss after — keep dismiss
-        root.dismiss()
+        // Stay open and jump home for a quick paste — no reopen needed
+        navigateToDir(home)
     }
     function cutFile(path) {
         copyFileToClipboard(path, "cut")
-        root.dismiss()
+        navigateToDir(home)
     }
     function pasteClipboard() {
         var src = String(clipboardPath||"")
         var op = String(clipboardOp||"copy")
         if (!src) {
-            // Fallback: try to get uri-list from system clipboard via wl-paste
-            // We do async paste via wl-paste, but for now just try to paste whatever is in system clipboard if our internal is empty
-            // Use a helper process to read wl-paste and then do gio copy
-            var pasteCmd = "src=$(wl-paste --type text/uri-list 2>/dev/null | head -n1 | sed 's/^file:\\/\\///' | sed 's/%20/ /g'); [ -z \"$src\" ] && src=$(wl-paste 2>/dev/null | head -n1); src=$(printf %s \"$src\" | tr -d '\\r\\n' | sed 's/^file:\\/\\///'); if [ -z \"$src\" ]; then echo NOCLIP; exit 0; fi; if [ ! -e \"$src\" ]; then echo NOTFOUND; exit 0; fi; dest=" + Util.shellQuote(currentDir) + "/$(basename -- \"$src\"); if [ -e \"$dest\" ]; then echo EXISTS; exit 0; fi; if [ \"" + op + "\" = \"cut\" ]; then gio move -- \"" + "\"$src\" \"$dest\" 2>/dev/null || mv -- \"$src\" \"$dest\" 2>/dev/null && echo MOVED || echo FAIL; else gio copy -- \"" + "\"$src\" \"$dest\" 2>/dev/null || cp -a -- \"$src\" \"$dest\" 2>/dev/null && echo COPIED || echo FAIL; fi"
-            // Actually we need src inside command — simpler: just try pasteProc
+            // Fallback: read uri-list from the system clipboard via wl-paste/xclip,
+            // then copy into the current dir — src never enters the JS layer.
             pasteProc.command = ["bash","-lc", "src=$(wl-paste --type text/uri-list 2>/dev/null | tr -d '\\r' | head -n1 | sed 's/^file:\\/\\///;s/%20/ /g' | tr -d '\\n'); if [ -z \"$src\" ]; then src=$(xclip -selection clipboard -o -t text/uri-list 2>/dev/null | head -n1 | sed 's/^file:\\/\\///' | tr -d '\\n'); fi; if [ -z \"$src\" ]; then echo NOCLIP; exit 0; fi; src=$(printf %s \"$src\" | sed 's/%0D//g' | head -n1); if [ ! -e \"$src\" ]; then echo NOTFOUND:$src; exit 0; fi; dest=" + Util.shellQuote(currentDir) + "/$(basename -- \"$src\"); if [ -e \"$dest\" ]; then echo EXISTS:$dest; exit 0; fi; gio copy \"$src\" \"$dest\" 2>/dev/null || cp -a -- \"$src\" \"$dest\" 2>/dev/null; if [ $? -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"]
             pasteProc.running = true
             return
@@ -952,10 +964,13 @@ Item {
         bumpFrecency(p)
         root.dismiss()
     }
-    function openTerminalHere(path) {
+    function openTerminalHere(path, isDirHint) {
         var p = String(path||"")
         var targetDir = p
-        if (p && p.charAt(p.length-1) !== "/" ) {
+        var isDir = typeof isDirHint === "boolean" ? isDirHint : (p && p.charAt(p.length-1) === "/")
+        if (isDir) {
+            targetDir = normalizeDir(p)
+        } else if (p && p.charAt(p.length-1) !== "/" ) {
             targetDir = Fuzzy.dirname(p)
             if (!targetDir || targetDir===".") targetDir = currentDir
         } else {
@@ -964,7 +979,9 @@ Item {
         if (!targetDir) targetDir = currentDir
         bumpFrecency(targetDir + "/")
         var cmd = "dir=" + Util.shellQuote(targetDir) + "; "
-        cmd += "if command -v omarchy >/dev/null 2>&1; then omarchy launch terminal --working-directory \"$dir\" >/dev/null 2>&1 & "
+        cmd += "if command -v xdg-terminal-exec >/dev/null 2>&1; then "
+        cmd += "  if command -v uwsm-app >/dev/null 2>&1; then uwsm-app -- xdg-terminal-exec --dir=\"$dir\" >/dev/null 2>&1 & "
+        cmd += "  else xdg-terminal-exec --dir=\"$dir\" >/dev/null 2>&1 & fi; "
         cmd += "elif command -v foot >/dev/null 2>&1; then foot -D \"$dir\" >/dev/null 2>&1 & "
         cmd += "elif command -v alacritty >/dev/null 2>&1; then alacritty --working-directory \"$dir\" >/dev/null 2>&1 & "
         cmd += "elif command -v kitty >/dev/null 2>&1; then kitty --directory \"$dir\" >/dev/null 2>&1 & "
@@ -976,7 +993,9 @@ Item {
     function trashItem(path) {
         var p = String(path||"")
         if (!p) return
-        var cmd = "gio trash " + Util.shellQuote(p) + " 2>/dev/null || trash-put " + Util.shellQuote(p) + " 2>/dev/null || rm -rf " + Util.shellQuote(p)
+        // No rm -rf fallback — the confirm dialog promises "Recoverable in Trash",
+        // so a missing trash tool must fail safe, not delete permanently.
+        var cmd = "gio trash " + Util.shellQuote(p) + " 2>/dev/null || trash-put " + Util.shellQuote(p) + " 2>/dev/null"
         Util.execDetached(cmd)
         trashRefreshTimer.restart()
         root.dismiss()
@@ -992,11 +1011,13 @@ Item {
         // For folders, basename may be empty if path ends with /, handle
         if (!name || name === "/") name = p
         trashTarget = { path: p, name: name }
+        trashConfirm.selectedIndex = 1
         trashConfirmOpen = true
     }
     function cancelTrashConfirm() {
         trashConfirmOpen = false
         trashTarget = null
+        trashConfirm.selectedIndex = 1
         Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
     }
     function confirmTrash() {
@@ -1006,6 +1027,63 @@ Item {
         if (!t || !t.path) return
         // Show that it's recoverable — actual trash, not rm
         trashItem(t.path)
+    }
+    function openHelp() { helpOpen = true }
+    function closeHelp() { helpOpen = false; Qt.callLater(function(){ keyCatcher.forceActiveFocus() }) }
+    function toggleHelp() { if (helpOpen) closeHelp(); else openHelp() }
+    function requestRename() {
+        if (renameOpen || helpOpen || trashConfirmOpen || openWithMode) return
+        if (!cursorActive || displayModel.count===0) return
+        var row = displayModel.get(selectedIndex)
+        if (!row || !row.path) return
+        var p = String(row.path||"")
+        if (!p || p.indexOf("Loading")===0 || p.indexOf("No ")===0) return
+        var isDir = !!row.isDir
+        var baseName = row.name
+        // display name includes trailing slash for dirs — strip for edit
+        if (isDir && baseName.charAt(baseName.length-1)==="/") baseName = baseName.slice(0,-1)
+        if (!baseName) baseName = Fuzzy.basename(p)
+        if (isDir && baseName.charAt(baseName.length-1)==="/") baseName = baseName.slice(0,-1)
+        renameTarget = { path: p, name: baseName, isDir: isDir }
+        renameText = baseName
+        renameError = ""
+        renameSelected = 1
+        renameOpen = true
+        Qt.callLater(function(){ if (renameInput) { renameInput.forceActiveFocus(); renameInput.selectAll() } })
+    }
+    function cancelRename() {
+        renameOpen = false
+        renameTarget = null
+        renameError = ""
+        renameSelected = 1
+        Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
+    }
+    function confirmRename() {
+        var t = renameTarget
+        if (!t || !t.path) return
+        var newName = String(renameText||"").trim()
+        if (!newName) { renameError = "Name cannot be empty"; return }
+        if (newName.indexOf("/")!==-1) { renameError = "Name cannot contain '/'"; return }
+        if (newName === t.name) { cancelRename(); return }
+        var dir = Fuzzy.dirname(t.path)
+        if (!dir || dir==="." ) dir = currentDir
+        dir = normalizeDir(dir)
+        var newPath = joinPath(dir, newName)
+        if (t.isDir) newPath += "/"
+        // Normalize for existence check — trim trailing slash for test
+        var checkPath = newPath
+        if (checkPath.charAt(checkPath.length-1)==="/") checkPath = checkPath.slice(0,-1)
+        if (!checkPath) checkPath = newPath
+        renameError = ""
+        // Async existence + move via renameProc
+        var cmd = "old=" + Util.shellQuote(t.path) + "; new=" + Util.shellQuote(newPath) + "; check=" + Util.shellQuote(checkPath) + "; "
+        cmd += "if [ -e \"$check\" ]; then echo EXISTS; exit 0; fi; "
+        // Try gio move first, fallback to mv
+        cmd += "gio move -- \"$old\" \"$new\" 2>/dev/null && echo MOVED:$new && exit 0; "
+        cmd += "mv -- \"$old\" \"$new\" 2>/dev/null && echo MOVED:$new && exit 0; "
+        cmd += "echo FAIL"
+        renameProc.command = ["bash","-lc", cmd]
+        renameProc.running = true
     }
 
     function createFolder() {
@@ -1025,6 +1103,35 @@ Item {
             }
         } }
     }
+
+    Process {
+        id: renameProc
+        stdout: StdioCollector { id: renameOutput; waitForEnd: true }
+        onExited: function(code){
+            var out = String(renameOutput.text||"").trim()
+            if (out === "EXISTS") {
+                renameError = "An item with that name already exists"
+                Qt.callLater(function(){ if (renameInput) { renameInput.forceActiveFocus(); renameInput.selectAll() } })
+                return
+            }
+            if (out.indexOf("MOVED:")===0) {
+                var created = out.slice(6)
+                var t = renameTarget
+                renameOpen = false
+                renameTarget = null
+                renameError = ""
+                if (created) bumpFrecency(created)
+                saveState()
+                refreshDir()
+                // Stay open — select the renamed entry once the list rebuilds
+                if (created) pendingRenameSelect = created
+                return
+            }
+            // FAIL
+            renameError = "Rename failed"
+        }
+    }
+    property string pendingRenameSelect: ""
 
     // ---- Open With ----
     function enterOpenWithMode(path) {
@@ -1102,12 +1209,9 @@ Item {
         Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
     }
     function rebuildAppDisplay() {
-        var _dbgShell = shell ? "shell:" + typeof shell : "no-shell"
-        var _dbgLib = appLibrary ? "ok" : (shell && shell.appLibrary ? "shellLib:" + typeof shell.appLibrary : "null")
         displayModel.clear()
         var lib = appLibrary || (shell && shell.appLibrary ? shell.appLibrary : null)
         // Build recommended set early for fallback path as well
-        var qEarly = String(filterText||"").trim().toLowerCase()
         var recSetEarly = {}
         var hasRecEarly = false
         if (openWithMode && openWithMime !== "" && openWithRecommendedIds.length > 0) {
@@ -1118,7 +1222,6 @@ Item {
                 recSetEarly[ridE] = true; recSetEarly[ridE.slice(0,-8)] = true
                 recSetEarly[String(openWithRecommendedIds[re]||"")] = true
             }
-        } else {
         }
         if (!lib) {
             // Fallback: directly use recommendedIds to build display (avoids 61->5 filtering confusion)
@@ -1160,14 +1263,6 @@ Item {
                         appId: df.id,
                         iconName: ""
                     })
-                    var _last2 = displayModel.get(displayModel.count-1);
-                }
-                if (displayModel.count > 0) {
-                    var _first = displayModel.get(0);
-                }
-                // Verify first entry after loop
-                if (displayModel.count > 0) {
-                    var _first = displayModel.get(0);
                 }
                 if (displayModel.count>0) { selectedIndex=0; cursorActive=true; layoutSerial++; Qt.callLater(function(){ resultList.positionViewAtIndex(0, ListView.Contain); }); return; }
             }
@@ -1316,9 +1411,12 @@ Item {
         var cmd = ""
         cmd += "uwsm-app -- gtk-launch " + qDesktop + " " + qFile + " >/dev/null 2>&1; ec=$?; [ $ec -eq 0 ] && exit 0; "
         cmd += "gtk-launch " + qDesktop + " " + qFile + " >/dev/null 2>&1; ec=$?; [ $ec -eq 0 ] && exit 0; "
-        cmd += "for d in /usr/share/applications /usr/local/share/applications $HOME/.local/share/applications; do [ -f \"$d/" + desktopFile + "\" ] && { gio launch \"$d/" + desktopFile + "\" " + qFile + " >/dev/null 2>&1; ec=$?; [ $ec -eq 0 ] && exit 0; }; done; "
+        // desktopFile is data — assign via single-quote so $/backticks in a crafted name stay literal
+        cmd += "for d in /usr/share/applications /usr/local/share/applications $HOME/.local/share/applications; do p=$d/" + Util.shellQuote(desktopFile) + "; [ -f \"$p\" ] && { gio launch \"$p\" " + qFile + " >/dev/null 2>&1; ec=$?; [ $ec -eq 0 ] && exit 0; }; done; "
         cmd += "handlr launch --with=" + qDesktop + " " + qFile + " >/dev/null 2>&1; ec=$?; [ $ec -eq 0 ] && exit 0; "
-        cmd += "echo \"Omafinder: launch failed for " + desktopFile + " with " + fp.replace(/"/g, '\\"') + "\" >> /tmp/omafinder_launch.log 2>&1; exit 1"
+        // Whole message is data — shellQuote keeps $(...) in a crafted filename from executing
+        var failMsg = "Omafinder: launch failed for " + desktopFile + " with " + fp
+        cmd += "echo " + Util.shellQuote(failMsg) + " >> /tmp/omafinder_launch.log 2>&1; exit 1"
         Util.execDetached(cmd)
         openWithMode = false
         openWithFile = ""
@@ -1389,12 +1487,58 @@ Item {
             Item {
                 id: keyCatcher
                 anchors.fill: parent
+                z: (root.trashConfirmOpen || root.helpOpen || root.renameOpen) ? 20 : 0
                 focus: true
                 Keys.priority: Keys.BeforeItem
                 Keys.onPressed: function(event){
+                    // Rename dialog has top priority
+                    if (renameOpen) {
+                        if (event.key === Qt.Key_Escape) {
+                            cancelRename(); event.accepted = true; return
+                        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            confirmRename(); event.accepted = true; return
+                        }
+                        // Let the TextInput handle everything else (editing, selection)
+                        return
+                    }
+                    // Help has top priority
+                    if (helpOpen) {
+                        if (event.key === Qt.Key_Escape || event.key === Qt.Key_F1 || event.key === Qt.Key_Question) {
+                            closeHelp(); event.accepted = true; return
+                        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            closeHelp(); event.accepted = true; return
+                        } else if (event.key === Qt.Key_Slash && (event.modifiers & Qt.ControlModifier)) {
+                            closeHelp(); event.accepted = true; return
+                        } else if (event.key === Qt.Key_Up) {
+                            helpFlickable.flick(0, 600); event.accepted = true; return
+                        } else if (event.key === Qt.Key_Down) {
+                            helpFlickable.flick(0, -600); event.accepted = true; return
+                        } else if (event.key === Qt.Key_PageUp) {
+                            helpFlickable.flick(0, 1200); event.accepted = true; return
+                        } else if (event.key === Qt.Key_PageDown) {
+                            helpFlickable.flick(0, -1200); event.accepted = true; return
+                        } else if (event.key === Qt.Key_Home) {
+                            helpFlickable.contentY = helpFlickable.originY; event.accepted = true; return
+                        } else if (event.key === Qt.Key_End) {
+                            helpFlickable.contentY = helpFlickable.originY + Math.max(0, helpFlickable.contentHeight - helpFlickable.height); event.accepted = true; return
+                        }
+                        event.accepted = true; return
+                    }
                     // Trash confirm has priority
                     if (trashConfirmOpen) {
                         if (trashConfirm.handleKey(event)) event.accepted = true
+                        return
+                    }
+                    // Help toggle — F1 or Ctrl+/ (also Ctrl+? via Question with Ctrl)
+                    if (event.key === Qt.Key_F1
+                        || (event.key === Qt.Key_Slash && (event.modifiers & Qt.ControlModifier))
+                        || (event.key === Qt.Key_Question && (event.modifiers & Qt.ControlModifier))) {
+                        toggleHelp(); event.accepted = true; return
+                    }
+                    // Rename — F2 on selected row
+                    if (event.key === Qt.Key_F2) {
+                        requestRename()
+                        event.accepted = true
                         return
                     }
                     // Open With mode has its own handling
@@ -1458,13 +1602,10 @@ Item {
                         }
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_C) {
-                        // Copy file (uri-list) for paste (Ctrl+C) — swapped per request
+                        // Copy file (uri-list) for paste (Ctrl+C) — stay open + go home for paste
                         if (displayModel.count>0 && cursorActive) {
                             var crow = displayModel.get(selectedIndex)
-                            if (crow.path) {
-                                copyFileToClipboard(crow.path, "copy")
-                                root.dismiss()
-                            }
+                            if (crow.path) copyFile(crow.path)
                         }
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_X) {
@@ -1491,11 +1632,11 @@ Item {
                         }
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_T) {
-                        // Terminal here
+                        // Terminal here — cd into selected folder if folder, else its parent; currentDir if no selection
                         if (displayModel.count>0 && cursorActive) {
                             var r2 = displayModel.get(selectedIndex)
-                            root.openTerminalHere(r2.path)
-                        } else root.openTerminalHere(currentDir)
+                            root.openTerminalHere(r2.path, r2.isDir)
+                        } else root.openTerminalHere(currentDir, true)
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_O) {
                         // Reveal in file manager
@@ -1515,9 +1656,10 @@ Item {
                         }
                         event.accepted = true
                     } else if (event.key === Qt.Key_Delete) {
+                        // Del routes through the same confirm — destructive keys never bypass the dialog
                         if (displayModel.count>0 && cursorActive) {
                             var delRow = displayModel.get(selectedIndex)
-                            root.trashItem(delRow.path)
+                            if (delRow.path) requestTrashWithConfirm(delRow.path)
                         }
                         event.accepted = true
                     } else if (event.key === Qt.Key_Backspace) {
@@ -1596,6 +1738,328 @@ Item {
                     cornerRadius: root.cornerRadius
                     onCanceled: cancelTrashConfirm()
                     onConfirmed: confirmTrash()
+                }
+
+                // Rename overlay — scrim + card with inline input and error
+                Item {
+                    id: renameOverlay
+                    anchors.fill: parent
+                    visible: renameOpen
+                    z: 32
+
+                    Rectangle {
+                        anchors.fill: parent
+                        color: Util.alpha(Color.menu.background, 0.65)
+                        MouseArea { anchors.fill: parent; onClicked: cancelRename() }
+
+                        BorderSurface {
+                            id: renameCard
+                            width: Math.min(parent.width - Style.space(32), Style.space(460))
+                            height: renameCard.contentTopInset + renameCard.contentBottomInset + Style.space(18) + Style.space(10) + Style.space(40) + (renameError !== "" ? Style.space(20) : 0) + Style.space(10) + Style.space(34)
+                            anchors.centerIn: parent
+                            color: root.background
+                            borderSpec: Border.flat(root.selectedText, Style.normalBorderWidth)
+                            padding: Style.space(18)
+                            radius: root.cornerRadius
+
+                            MouseArea { anchors.fill: parent; onClicked: { if (renameInput) renameInput.forceActiveFocus() } }
+
+                            Item {
+                                anchors.fill: parent
+                                anchors.topMargin: renameCard.contentTopInset
+                                anchors.rightMargin: renameCard.contentRightInset
+                                anchors.bottomMargin: renameCard.contentBottomInset
+                                anchors.leftMargin: renameCard.contentLeftInset
+
+                                Text {
+                                    id: renameTitle
+                                    textFormat: Text.PlainText
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.top: parent.top
+                                    text: "Rename"
+                                    color: root.foreground
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.title
+                                }
+
+                                Rectangle {
+                                    id: renameField
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.top: renameTitle.bottom
+                                    anchors.topMargin: Style.space(10)
+                                    height: Style.space(40)
+                                    radius: root.cornerRadius
+                                    color: Qt.rgba(1,1,1,0.04)
+                                    border.width: renameInput.activeFocus ? 1 : 0
+                                    border.color: Util.alpha(root.selectedText, 0.6)
+
+                                    TextInput {
+                                        id: renameInput
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        anchors.leftMargin: Style.space(12)
+                                        anchors.rightMargin: Style.space(12)
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        height: implicitHeight
+                                        text: renameText
+                                        color: root.foreground
+                                        font.family: root.fontFamily
+                                        font.pixelSize: Style.font.body
+                                        clip: true
+                                        selectByMouse: true
+                                        onTextEdited: root.renameText = text
+                                        Keys.priority: Keys.BeforeItem
+                                        Keys.onPressed: function(event) {
+                                            if (event.key === Qt.Key_Escape) {
+                                                cancelRename()
+                                                event.accepted = true
+                                            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                                                confirmRename()
+                                                event.accepted = true
+                                            }
+                                        }
+                                        Component.onCompleted: {
+                                            if (renameOpen) { forceActiveFocus(); selectAll() }
+                                        }
+                                    }
+                                }
+
+                                Text {
+                                    id: renameErrorText
+                                    textFormat: Text.PlainText
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.top: renameField.bottom
+                                    anchors.topMargin: Style.space(6)
+                                    text: renameError
+                                    visible: renameError !== ""
+                                    color: Color.urgent
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    elide: Text.ElideRight
+                                }
+
+                                Row {
+                                    anchors.right: parent.right
+                                    anchors.bottom: parent.bottom
+                                    spacing: Style.space(10)
+
+                                    Repeater {
+                                        model: ["Cancel", "Rename"]
+
+                                        BorderSurface {
+                                            required property int index
+                                            required property string modelData
+
+                                            readonly property bool selected: renameSelected === index
+                                            readonly property bool destructive: index === 1
+
+                                            width: Style.space(88)
+                                            height: Style.space(34)
+                                            color: selected
+                                                ? (destructive ? Util.alpha(Color.urgent, 0.22) : root.selectedBackground)
+                                                : "transparent"
+                                            borderSpec: Border.flat(destructive
+                                                ? (selected ? Color.urgent : Util.alpha(Color.urgent, 0.56))
+                                                : (selected ? root.selectedText : Util.alpha(root.foreground, 0.38)), Style.normalBorderWidth)
+                                            radius: 0
+
+                                            Text {
+                                                textFormat: Text.PlainText
+                                                anchors.centerIn: parent
+                                                text: modelData
+                                                color: destructive ? (selected ? Color.urgent : root.foreground) : (selected ? root.selectedText : root.foreground)
+                                                font.family: root.fontFamily
+                                                font.pixelSize: Style.font.caption
+                                            }
+
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                hoverEnabled: true
+                                                cursorShape: Qt.PointingHandCursor
+                                                onEntered: renameSelected = index
+                                                onClicked: {
+                                                    if (index === 0) cancelRename()
+                                                    else confirmRename()
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Help overlay — scrim + card with scrollable keybinding reference
+                Item {
+                    id: helpOverlay
+                    anchors.fill: parent
+                    visible: helpOpen
+                    z: 31
+
+                    Rectangle {
+                        anchors.fill: parent
+                        color: Util.alpha(Color.menu.background, 0.65)
+                        MouseArea { anchors.fill: parent; onClicked: closeHelp() }
+
+                        BorderSurface {
+                            id: helpCard
+                            width: Math.min(parent.width - Style.space(32), Style.space(520))
+                            height: Math.min(parent.height - Style.space(32), Style.space(560))
+                            anchors.centerIn: parent
+                            color: root.background
+                            borderSpec: Border.flat(root.selectedText, Style.normalBorderWidth)
+                            padding: Style.space(16)
+                            radius: root.cornerRadius
+                            MouseArea { anchors.fill: parent; onClicked: {} }
+
+                            Item {
+                                anchors.fill: parent
+                                anchors.topMargin: helpCard.contentTopInset
+                                anchors.rightMargin: helpCard.contentRightInset
+                                anchors.bottomMargin: helpCard.contentBottomInset
+                                anchors.leftMargin: helpCard.contentLeftInset
+
+                                Column {
+                                    anchors.fill: parent
+                                    spacing: Style.space(10)
+
+                                    Row {
+                                        width: parent.width
+                                        spacing: Style.space(8)
+                                        Text {
+                                            textFormat: Text.PlainText
+                                            text: "Keybindings"
+                                            color: root.foreground
+                                            font.family: root.fontFamily
+                                            font.pixelSize: Style.font.title
+                                            font.weight: Font.Medium
+                                        }
+                                        Item { width: Style.space(8); height: 1 }
+                                        Text {
+                                            textFormat: Text.PlainText
+                                            text: "F1 / Ctrl+/ to close • Esc"
+                                            color: root.foreground
+                                            opacity: 0.45
+                                            font.family: root.fontFamily
+                                            font.pixelSize: Style.font.caption
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                    }
+
+                                    Rectangle { width: parent.width; height: 1; color: Util.alpha(root.foreground, 0.12) }
+
+                                    Flickable {
+                                        id: helpFlickable
+                                        width: parent.width
+                                        height: parent.height - Style.space(28) - Style.space(34) - Style.space(20) // title + divider + button + spacing
+                                        contentHeight: helpContent.implicitHeight
+                                        contentWidth: width
+                                        clip: true
+                                        flickableDirection: Flickable.VerticalFlick
+                                        boundsBehavior: Flickable.StopAtBounds
+
+                                        Column {
+                                            id: helpContent
+                                            width: parent.width
+                                            spacing: Style.space(14)
+
+                                            // Helper to render section — inlined as repeated Columns
+                                            Column {
+                                                width: parent.width
+                                                spacing: Style.space(6)
+                                                Text { textFormat: Text.PlainText; text: "Navigation"; color: root.foreground; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.weight: Font.Medium }
+                                                Column {
+                                                    width: parent.width
+                                                    spacing: 3
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "↑ / ↓  — Move selection"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "PgUp / PgDn  — Jump 6 rows"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Home / End  — First / Last"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "← (empty filter) / Backspace (empty) / Alt+Backspace  — Parent"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Enter  — Open file / Enter folder / Go to typed path"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Type  — Filter (≥2 chars global, <2 local, path-like direct)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Backspace / Ctrl+Backspace / Ctrl+U  — Delete char / word / clear filter"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                }
+                                            }
+                                            Column {
+                                                width: parent.width
+                                                spacing: Style.space(6)
+                                                Text { textFormat: Text.PlainText; text: "File actions"; color: root.foreground; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.weight: Font.Medium }
+                                                Column {
+                                                    width: parent.width
+                                                    spacing: 3
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+C  — Copy file → stay, jump to ~ for paste"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+X  — Cut file → stay, jump to ~ for paste"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+V  — Paste into current folder"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+Shift+C  — Copy absolute path"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+D  — Trash (confirm)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Del  — Trash immediate"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+N  — New folder"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "F2  — Rename (Enter confirm, Esc cancel, conflict errors in dialog)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+T  — Terminal here (folder → that folder, file → its dir)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+O  — Reveal in file manager"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+Shift+O  — Open With…"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                }
+                                            }
+                                            Column {
+                                                width: parent.width
+                                                spacing: Style.space(6)
+                                                Text { textFormat: Text.PlainText; text: "View / Go"; color: root.foreground; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.weight: Font.Medium }
+                                                Column {
+                                                    width: parent.width
+                                                    spacing: 3
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+H / Ctrl+.  — Toggle hidden files"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+Shift+H  — Go home (~)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Esc  — Back (Open With) / Close (browse)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                }
+                                            }
+                                            Column {
+                                                width: parent.width
+                                                spacing: Style.space(6)
+                                                Text { textFormat: Text.PlainText; text: "Open With mode"; color: root.foreground; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.weight: Font.Medium }
+                                                Column {
+                                                    width: parent.width
+                                                    spacing: 3
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Type  — Filter apps"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Enter  — Launch with file"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Esc  — Back to browse"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                }
+                                            }
+                                            Column {
+                                                width: parent.width
+                                                spacing: Style.space(6)
+                                                Text { textFormat: Text.PlainText; text: "Dialogs"; color: root.foreground; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.weight: Font.Medium }
+                                                Column {
+                                                    width: parent.width
+                                                    spacing: 3
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Trash confirm:  ←/→/Tab switch, Enter confirm, Esc cancel, click scrim cancel"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Help:  Esc / Enter / F1 / Ctrl+/ close, click scrim close"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                }
+                                            }
+                                            Text { width: parent.width; textFormat: Text.PlainText; text: "Mouse: hover selects, click opens. Open With: click launches."; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption; wrapMode: Text.WordWrap }
+                                        }
+                                    }
+
+                                    Row {
+                                        anchors.right: parent.right
+                                        spacing: Style.space(10)
+                                        BorderSurface {
+                                            width: Style.space(88)
+                                            height: Style.space(34)
+                                            color: Util.alpha(Color.urgent, 0.10)
+                                            borderSpec: Border.flat(Util.alpha(Color.urgent, 0.56), Style.normalBorderWidth)
+                                            radius: 0
+                                            Text { textFormat: Text.PlainText; anchors.centerIn: parent; text: "Close"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: closeHelp() }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1708,7 +2172,6 @@ Item {
                             required property string iconName
                             readonly property bool hasCursor: root.cursorActive && row.index === root.selectedIndex
                             readonly property bool isApp: openWithMode && appId !== ""
-                            readonly property bool hasFileIcon: !isApp && iconName !== ""
                             width: ListView.view.width
                             height: root.rowHeight
                             radius: root.cornerRadius
@@ -1865,54 +2328,31 @@ Item {
                     }
                 }
 
-                // Footer hints
+                // Persistent footer — single, always visible (merged)
                 Rectangle {
                     width: parent.width
-                    height: Style.space(22)
+                    height: Style.space(28)
                     radius: root.cornerRadius
                     color: "transparent"
                     Row {
                         anchors.centerIn: parent
                         spacing: Style.space(8)
                         visible: !openWithMode
-                        Text { text: "↵ open"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                        Text { text: "⌫ parent"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                        Text { text: "⎋ close"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                        Text { text: "Ctrl+H hidden"; color: root.foreground; opacity: showHidden ? 0.45 : 0.25; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                        Text { text: "Ctrl+C copy"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                        Text { text: "Ctrl+D trash"; color: root.foreground; opacity: trashConfirmOpen ? 0.8 : 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                        Text { text: "Ctrl+X cut"; color: root.foreground; opacity: clipboardOp==="cut" ? 0.7 : 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                        Text { text: "Ctrl+V paste"; color: root.foreground; opacity: clipboardPath ? 0.65 : 0.25; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                        Text { text: "Ctrl+D trash"; color: root.foreground; opacity: trashConfirmOpen ? 0.8 : 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.85 }
+                        Text { text: "F2 rename"; color: root.foreground; opacity: renameOpen ? 0.85 : 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.85 }
+                        Text { text: "Ctrl+Shift+C copy path"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.85 }
+                        Text { text: "Ctrl+Shift+O open with"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.85 }
+                        Text { text: "Ctrl+T term"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.85 }
+                        Text { text: "F1 / Ctrl+/ help"; color: root.foreground; opacity: helpOpen ? 0.85 : 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.85 }
                     }
                     Row {
                         anchors.centerIn: parent
                         spacing: Style.space(10)
-                        visible: !openWithMode
-                        // Second row for extra hints — shown as wrap if needed, keep single row for now with smaller spacing
-                    }
-                    Row {
-                        anchors.centerIn: parent
-                        spacing: Style.space(12)
                         visible: openWithMode
                         Text { text: "↵ launch"; color: root.foreground; opacity: 0.55; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "⎋ back"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "type to filter apps"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                    }
-                }
-                // Second footer line for open-with / term hints (only when not in openWith)
-                Rectangle {
-                    width: parent.width
-                    height: openWithMode ? 0 : Style.space(18)
-                    visible: !openWithMode
-                    color: "transparent"
-                    Row {
-                        anchors.centerIn: parent
-                        spacing: Style.space(8)
-                        Text { text: "Ctrl+Shift+C copy path"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
-                        Text { text: "Ctrl+Shift+H home"; color: root.foreground; opacity: 0.4; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
-                        Text { text: "Ctrl+Shift+O open with"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
-                        Text { text: "Ctrl+T term"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
-                        Text { text: "Ctrl+O reveal"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
+                        Text { text: "F1 help"; color: root.foreground; opacity: helpOpen ? 0.85 : 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
                     }
                 }
             }
