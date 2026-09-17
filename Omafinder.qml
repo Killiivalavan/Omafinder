@@ -37,6 +37,9 @@ Item {
     property bool openWithMode: false
     property string openWithFile: ""
     readonly property var appLibrary: shell && shell.appLibrary ? shell.appLibrary : null
+    // Trash confirm
+    property bool trashConfirmOpen: false
+    property var trashTarget: null
     // Icon cache for files (path -> iconName) to avoid repeated gio calls
     property var iconCache: ({})
     property var mimeCache: ({}) // path -> mimetype
@@ -101,12 +104,18 @@ Item {
         root.isAnimatingOut = false
         openWithMode = false
         openWithFile = ""
+        trashConfirmOpen = false
+        trashTarget = null
         if (searchProc.running) searchProc.running = false
         searchDebounce.stop()
         isSearching = false
     }
 
     function dismiss() {
+        if (trashConfirmOpen) {
+            cancelTrashConfirm()
+            return
+        }
         if (root.isAnimatingOut) return
         // If in Open With, just exit that mode instead of dismissing overlay
         if (openWithMode) {
@@ -974,6 +983,31 @@ Item {
     }
     Timer { id: trashRefreshTimer; interval: 500; onTriggered: refreshDir() }
 
+    function requestTrashWithConfirm(path) {
+        var p = String(path||"")
+        if (!p) return
+        // Avoid confirming for placeholder entries
+        if (p === "" || p.indexOf("Loading") === 0 || p.indexOf("No ") === 0) return
+        var name = Fuzzy.basename(p)
+        // For folders, basename may be empty if path ends with /, handle
+        if (!name || name === "/") name = p
+        trashTarget = { path: p, name: name }
+        trashConfirmOpen = true
+    }
+    function cancelTrashConfirm() {
+        trashConfirmOpen = false
+        trashTarget = null
+        Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
+    }
+    function confirmTrash() {
+        var t = trashTarget
+        trashConfirmOpen = false
+        trashTarget = null
+        if (!t || !t.path) return
+        // Show that it's recoverable — actual trash, not rm
+        trashItem(t.path)
+    }
+
     function createFolder() {
         var base = currentDir
         var name = "New Folder"
@@ -1302,11 +1336,10 @@ Item {
     // ---- Models ----
     ListModel {
         id: displayModel
-        Component.onCompleted: {
-            // Ensure all roles exist from start so delegate isApp/appIcon binding works
-            append({name:"", path:"", isDir:false, detail:"", hidden:false, iconName:"", appIcon:"", appId:""})
-            clear()
-        }
+        // Explicit role definition via ListElement so delegate required properties always bind
+        // Without this, first append defines roles and later appends with new roles (appIcon/appId) are ignored for recycled delegates
+        ListElement { name: ""; path: ""; isDir: false; detail: ""; hidden: false; iconName: ""; appIcon: ""; appId: "" }
+        Component.onCompleted: clear()
     }
     PointerMoveGate { id: pointerGate; referenceItem: card }
 
@@ -1359,6 +1392,11 @@ Item {
                 focus: true
                 Keys.priority: Keys.BeforeItem
                 Keys.onPressed: function(event){
+                    // Trash confirm has priority
+                    if (trashConfirmOpen) {
+                        if (trashConfirm.handleKey(event)) event.accepted = true
+                        return
+                    }
                     // Open With mode has its own handling
                     if (openWithMode) {
                         if (event.key === Qt.Key_Escape) {
@@ -1395,8 +1433,14 @@ Item {
                         }
                         return
                     }
-                    // Hidden toggle: Ctrl+H or Ctrl+Dot
-                    if ((event.modifiers & Qt.ControlModifier) && (event.key === Qt.Key_H || event.key === Qt.Key_Period)) {
+                    // Home: Ctrl+Shift+H
+                    if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_H) {
+                        navigateToDir(home)
+                        event.accepted = true
+                        return
+                    }
+                    // Hidden toggle: Ctrl+H (without Shift) or Ctrl+Dot
+                    if ((event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.ShiftModifier) && (event.key === Qt.Key_H || event.key === Qt.Key_Period)) {
                         root.toggleHidden()
                         event.accepted = true
                         return
@@ -1463,6 +1507,13 @@ Item {
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_N) {
                         root.createFolder()
                         event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_D) {
+                        // Trash with confirm (Ctrl+D) — recoverable
+                        if (displayModel.count>0 && cursorActive) {
+                            var drow = displayModel.get(selectedIndex)
+                            if (drow.path) requestTrashWithConfirm(drow.path)
+                        }
+                        event.accepted = true
                     } else if (event.key === Qt.Key_Delete) {
                         if (displayModel.count>0 && cursorActive) {
                             var delRow = displayModel.get(selectedIndex)
@@ -1526,6 +1577,25 @@ Item {
                     } else if (event.key === Qt.Key_Tab) {
                         event.accepted = true
                     }
+                }
+
+                ConfirmDialog {
+                    id: trashConfirm
+                    anchors.fill: parent
+                    opened: trashConfirmOpen
+                    z: 10
+                    message: trashTarget ? ("Move “" + String(trashTarget.name||"") + "” to Trash?\nRecoverable in Trash.") : "Move to Trash?"
+                    confirmText: "Move to Trash"
+                    cancelText: "Cancel"
+                    background: root.background
+                    foreground: root.foreground
+                    scrim: root.scrim
+                    selectedBackground: root.selectedBackground
+                    selectedText: root.selectedText
+                    fontFamily: root.fontFamily
+                    cornerRadius: root.cornerRadius
+                    onCanceled: cancelTrashConfirm()
+                    onConfirmed: confirmTrash()
                 }
             }
 
@@ -1803,13 +1873,14 @@ Item {
                     color: "transparent"
                     Row {
                         anchors.centerIn: parent
-                        spacing: Style.space(10)
+                        spacing: Style.space(8)
                         visible: !openWithMode
                         Text { text: "↵ open"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "⌫ parent"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "⎋ close"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "Ctrl+H hidden"; color: root.foreground; opacity: showHidden ? 0.45 : 0.25; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "Ctrl+C copy"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                        Text { text: "Ctrl+D trash"; color: root.foreground; opacity: trashConfirmOpen ? 0.8 : 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "Ctrl+X cut"; color: root.foreground; opacity: clipboardOp==="cut" ? 0.7 : 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "Ctrl+V paste"; color: root.foreground; opacity: clipboardPath ? 0.65 : 0.25; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                     }
@@ -1836,8 +1907,9 @@ Item {
                     color: "transparent"
                     Row {
                         anchors.centerIn: parent
-                        spacing: Style.space(10)
+                        spacing: Style.space(8)
                         Text { text: "Ctrl+Shift+C copy path"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
+                        Text { text: "Ctrl+Shift+H home"; color: root.foreground; opacity: 0.4; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
                         Text { text: "Ctrl+Shift+O open with"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
                         Text { text: "Ctrl+T term"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
                         Text { text: "Ctrl+O reveal"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
