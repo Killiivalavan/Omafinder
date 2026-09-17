@@ -1587,15 +1587,20 @@ Item {
                     message: trashTarget ? ("Move “" + String(trashTarget.name||"") + "” to Trash?\nRecoverable in Trash.") : "Move to Trash?"
                     confirmText: "Move to Trash"
                     cancelText: "Cancel"
-                    background: Color.background
+                    background: Qt.rgba(0.16, 0.16, 0.16, 1.0)
                     foreground: Color.foreground
-                    scrim: Util.alpha(Color.background, 0.92)
+                    scrim: Qt.rgba(0.05, 0.05, 0.05, 0.92)
                     selectedBackground: Color.menu.selectedBackground
                     selectedText: Color.menu.selectedText
                     fontFamily: root.fontFamily
                     cornerRadius: root.cornerRadius
                     onCanceled: cancelTrashConfirm()
                     onConfirmed: confirmTrash()
+                    onOpenedChanged: {
+                        if (opened) {
+                            console.log("Omafinder: trashConfirm opened bg=" + String(background) + " scrim=" + String(scrim) + " fg=" + String(foreground) + " Color.bg=" + String(Color.background) + " Color.menu.bg=" + String(Color.menu.background));
+                        }
+                    }
                 }
             }
 
