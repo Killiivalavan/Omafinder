@@ -1062,6 +1062,7 @@ Item {
         Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
     }
     function rebuildAppDisplay() {
+        console.log("Omafinder: rebuildAppDisplay openWithMode=" + openWithMode + " mime=" + openWithMime + " allIds=" + openWithAllIds.length + " rec=" + openWithRecommendedIds.length + " q=" + filterText + " lib=" + (appLibrary ? "ok" : (shell && shell.appLibrary ? "shellLib" : "null")))
         displayModel.clear()
         var lib = appLibrary || (shell && shell.appLibrary ? shell.appLibrary : null)
         if (!lib) {
