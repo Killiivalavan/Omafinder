@@ -1087,51 +1087,94 @@ Item {
             console.log("Omafinder: hasRecEarly false - recLen=" + openWithRecommendedIds.length + " mime=" + openWithMime)
         }
         if (!lib) {
-            // Fallback via DesktopEntries — but still respect Recommended filter
+            // Fallback: directly use recommendedIds to build display (avoids 61->5 filtering confusion)
+            console.log("Omafinder: fallback direct rec len=" + openWithRecommendedIds.length + " hasRecEarly=" + hasRecEarly);
+            if (hasRecEarly && openWithRecommendedIds.length > 0) {
+                var q2b = String(filterText||"").trim().toLowerCase();
+                var directFiltered = [];
+                for (var di2=0; di2<openWithRecommendedIds.length; di2++) {
+                    var did2 = String(openWithRecommendedIds[di2]||"");
+                    if (!did2) continue;
+                    var found = null;
+                    try {
+                        if (typeof DesktopEntries !== "undefined" && DesktopEntries.applications) {
+                            var vals2 = DesktopEntries.applications.values || [];
+                            for (var vi2=0; vi2<vals2.length; vi2++) {
+                                var de2 = vals2[vi2];
+                                var iid2 = String(de2.id||"");
+                                if (iid2 === did2 || iid2 + ".desktop" === did2 || iid2 === did2.slice(0,-8)) { found = de2; break; }
+                            }
+                        }
+                    } catch(e2) {}
+                    var label2 = found ? String(found.name||did2) : did2;
+                    var icon2 = found ? String(found.icon||did2) : did2;
+                    var detail2 = found ? String(found.comment||did2) : did2;
+                    if (q2b && label2.toLowerCase().indexOf(q2b)===-1 && did2.toLowerCase().indexOf(q2b)===-1) {
+                        if (Fuzzy.fuzzyScore(q2b, label2) < 0 && Fuzzy.fuzzyScore(q2b, did2) < 0) continue;
+                    }
+                    directFiltered.push({id: did2, label: label2, icon: icon2, detail: detail2, entry: found});
+                }
+                directFiltered.sort(function(a,b){ return String(a.label).localeCompare(String(b.label)); });
+                console.log("Omafinder: fallback direct filtered len=" + directFiltered.length);
+                for (var fi3=0; fi3<Math.min(directFiltered.length,100); fi3++) {
+                    var df = directFiltered[fi3];
+                    console.log("Omafinder: fallback direct append fi3=" + fi3 + " id=" + df.id + " icon=" + df.icon + " label=" + df.label);
+                    displayModel.append({
+                        name: df.label,
+                        path: df.id,
+                        isDir: false,
+                        detail: df.detail,
+                        hidden: false,
+                        appIcon: df.icon,
+                        appId: df.id
+                    });
+                }
+                if (displayModel.count>0) { selectedIndex=0; cursorActive=true; layoutSerial++; Qt.callLater(function(){ resultList.positionViewAtIndex(0, ListView.Contain); }); return; }
+            }
+            // Fallback to showing filtered via DesktopEntries if direct failed
             try {
                 if (typeof DesktopEntries !== "undefined" && DesktopEntries.applications) {
-                    var vals = DesktopEntries.applications.values || []
-                    console.log("Omafinder: fallback vals len=" + vals.length + " hasRecEarly=" + hasRecEarly)
+                    var vals = DesktopEntries.applications.values || [];
+                    console.log("Omafinder: fallback vals len=" + vals.length + " hasRecEarly=" + hasRecEarly);
                     if (vals.length > 0) {
-                        var q2 = String(filterText||"").trim().toLowerCase()
-                        var filtered = []
+                        var q2 = String(filterText||"").trim().toLowerCase();
+                        var filtered = [];
                         for (var vi=0; vi<vals.length; vi++) {
-                            var de = vals[vi]
-                            var id = String(de.id||"")
-                            var withExt = id.slice(-8) === ".desktop" ? id : id + ".desktop"
-                            var withoutExt = id.slice(-8) === ".desktop" ? id.slice(0,-8) : id
-                            if (hasRecEarly && !recSetEarly[withExt] && !recSetEarly[withoutExt] && !recSetEarly[id]) continue
-                            var name = String(de.name||id)
+                            var de = vals[vi];
+                            var id = String(de.id||"");
+                            var withExt = id.slice(-8) === ".desktop" ? id : id + ".desktop";
+                            var withoutExt = id.slice(-8) === ".desktop" ? id.slice(0,-8) : id;
+                            if (hasRecEarly && !recSetEarly[withExt] && !recSetEarly[withoutExt] && !recSetEarly[id]) continue;
+                            var name = String(de.name||id);
                             if (q2 && name.toLowerCase().indexOf(q2)===-1 && id.toLowerCase().indexOf(q2)===-1) {
-                                if (Fuzzy.fuzzyScore(q2, name) < 0 && Fuzzy.fuzzyScore(q2, id) < 0) continue
+                                if (Fuzzy.fuzzyScore(q2, name) < 0 && Fuzzy.fuzzyScore(q2, id) < 0) continue;
                             }
-                            filtered.push({entry: de, label: name})
+                            filtered.push({entry: de, label: name});
                         }
-                        filtered.sort(function(a,b){ return String(a.label).localeCompare(String(b.label)) })
+                        filtered.sort(function(a,b){ return String(a.label).localeCompare(String(b.label)); });
+                        console.log("Omafinder: fallback filtered len=" + filtered.length + " first=" + (filtered[0] ? String(filtered[0].entry.id||"") : "none"));
                         for (var fi2=0; fi2<Math.min(filtered.length,100); fi2++) {
-                            var fe = filtered[fi2].entry
+                            var fe = filtered[fi2].entry;
+                            var _aicon = String(fe.icon||"");
+                            console.log("Omafinder: fallback append fi2=" + fi2 + " id=" + String(fe.id||"") + " icon=" + _aicon + " name=" + String(fe.name||""));
+                            if (fi2 < 3) console.log("Omafinder: fallback appIcon for " + String(fe.id||"") + " -> " + _aicon);
                             displayModel.append({
                                 name: String(fe.name||fe.id||""),
                                 path: String(fe.id||""),
                                 isDir: false,
                                 detail: String(fe.comment||fe.id||""),
                                 hidden: false,
-                                appIcon: String(fe.icon||""),
+                                appIcon: _aicon,
                                 appId: String(fe.id||"")
-                            })
+                            });
                         }
-                        if (displayModel.count>0) { selectedIndex=0; cursorActive=true; layoutSerial++; Qt.callLater(function(){ resultList.positionViewAtIndex(0, ListView.Contain) }); return }
-                        // If filtered empty but we had rec, show empty, not all
-                        if (hasRecEarly) {
-                            displayModel.append({name:"No apps for “" + filterText + "”", path:"", isDir:false, detail:"No recommended handler for " + openWithMime, hidden:false})
-                            selectedIndex=0; cursorActive=false; layoutSerial++; return
-                        }
+                        if (displayModel.count>0) { selectedIndex=0; cursorActive=true; layoutSerial++; Qt.callLater(function(){ resultList.positionViewAtIndex(0, ListView.Contain); }); return; }
                     }
                 }
             } catch(e) {}
-            displayModel.append({name:"No apps found", path:"", isDir:false, detail:"AppLibrary not available" + (shell ? " (shell ok, lib null)" : " (shell null)"), hidden:false})
-            console.warn("Omafinder: appLibrary unavailable — shell=" + (shell ? "present" : "null") + " appLibrary prop=" + appLibrary)
-            return
+            displayModel.append({name:"No apps found", path:"", isDir:false, detail:"AppLibrary not available" + (shell ? " (shell ok, lib null)" : " (shell null)"), hidden:false});
+            console.warn("Omafinder: appLibrary unavailable — shell=" + (shell ? "present" : "null") + " appLibrary prop=" + appLibrary);
+            return;
         }
         var q = String(filterText||"").trim().toLowerCase()
         // Strict mime filtering: when in Open With, only show handlers for that mime (recommended + all for type)
@@ -1608,27 +1651,21 @@ Item {
                                     width: Style.space(28)
                                     height: Style.space(28)
                                     source: {
+                                        console.log("Omafinder: appIcon source eval visible=" + visible + " isApp=" + row.isApp + " appIcon=" + row.appIcon + " name=" + row.name);
                                         if (!visible) return "";
                                         var name = String(row.appIcon||"");
+                                        console.log("Omafinder: appIcon source try name=" + name + " for " + row.name + " visible=" + visible + " isApp=" + row.isApp);
                                         if (!name) return "";
                                         if (name.indexOf("/") === 0 || name.indexOf("file://") === 0) return name.indexOf("file://")===0 ? name : Util.fileUrl(name);
-                                        // Try AppLibrary first (has iconIndex for newly installed icons)
                                         if (appLibrary) {
                                             try {
                                                 var s = appLibrary.iconSource(name);
-                                                if (s && String(s).length) {
-                                                    // console.log("Omafinder: appIcon " + name + " via appLibrary -> " + s)
-                                                    return s;
-                                                }
+                                                if (s && String(s).length) return s;
                                             } catch(e) {}
                                         }
                                         var qp = Quickshell.iconPath(name, true);
-                                        // console.log("Omafinder: appIcon " + name + " Quickshell -> " + qp)
-                                        if (qp && String(qp).length && qp.indexOf("application-x-executable") === -1) return qp;
-                                        // Fallback: try direct hicolor file as file://
-                                        // Use 48x48, 128x128, 256x256, scalable in order
-                                        var cand = "/usr/share/icons/hicolor/48x48/apps/" + name + ".png";
-                                        return Util.fileUrl(cand);
+                                        if (qp && String(qp).length) return qp;
+                                        return Util.fileUrl("/usr/share/icons/hicolor/48x48/apps/" + name + ".png");
                                     }
                                     fillMode: Image.PreserveAspectFit
                                     sourceSize.width: width * Screen.devicePixelRatio
@@ -1637,7 +1674,7 @@ Item {
                                     anchors.verticalCenter: parent.verticalCenter
                                     onStatusChanged: {
                                         if (status === Image.Error) {
-                                            console.log("Omafinder: appIcon FAILED name=" + row.appIcon + " source=" + source + " row=" + row.name)
+                                            console.log("Omafinder: appIcon FAILED name=" + row.appIcon + " source=" + source + " for " + row.name);
                                             visible = false
                                         } else if (status === Image.Ready) {
                                             // console.log("Omafinder: appIcon OK " + row.appIcon)
