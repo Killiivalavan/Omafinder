@@ -21,10 +21,9 @@ Item {
     property bool cursorActive: false
     property bool showHidden: true
     property bool showHiddenPersisted: true
-    property var globalPaths: []
-    property bool globalIndexReady: false
-    property bool globalIndexLoading: false
     property var dirEntries: [] // {name, path, isDir, hidden}
+    property string pendingSearchQuery: ""
+    property bool isSearching: false
     property var frecency: ({})
     property string statePath: home + "/.local/state/omarchy/omafinder/state.json"
     property string stateDir: home + "/.local/state/omarchy/omafinder"
@@ -65,7 +64,6 @@ Item {
     function open(payloadJson) {
         var payload = {}
         try { payload = JSON.parse(payloadJson || "{}") } catch(e) { payload = {} }
-        // Restore state if not yet loaded
         if (stateFile.text() && !stateLoaded) loadState(stateFile.text())
         if (!currentDir || currentDir === "") currentDir = home
         root.opened = true
@@ -73,20 +71,28 @@ Item {
         root.filterText = ""
         root.selectedIndex = 0
         root.cursorActive = true
+        pendingSearchQuery = ""
+        isSearching = false
+        if (searchProc.running) searchProc.running = false
+        searchDebounce.stop()
         root.rebuildDisplay()
         refreshDir()
-        ensureGlobalIndex()
         Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
     }
 
     function close() {
         root.opened = false
         root.isAnimatingOut = false
+        if (searchProc.running) searchProc.running = false
+        searchDebounce.stop()
+        isSearching = false
     }
 
     function dismiss() {
         if (root.isAnimatingOut) return
         root.isAnimatingOut = true
+        if (searchProc.running) searchProc.running = false
+        searchDebounce.stop()
         dismissTimer.restart()
     }
 
@@ -246,13 +252,11 @@ Item {
 
     Process {
         id: listProc
-        property string collected: ""
-        stdout: SplitParser { onRead: function(line){ listProc.collected += line + "\n" } }
+        stdout: StdioCollector { id: listOutput; waitForEnd: true }
         stderr: StdioCollector { waitForEnd: true }
-        onStarted: collected = ""
         onExited: function(code){
-            var raw = collected
-            var lines = String(raw||"").split("\n")
+            var raw = String(listOutput.text||"")
+            var lines = raw.split("\n")
             var entries = []
             for (var i=0;i<lines.length;i++){
                 var line = lines[i]
@@ -266,73 +270,169 @@ Item {
                 entries.push({name:name, path:full, isDir:isDir, hidden:isHiddenName(name)})
             }
             dirEntries = entries
-            if (root.opened) root.rebuildDisplay()
+            if (root.opened) {
+                // Only rebuild if not in search mode (filter empty or path-like)
+                var q = String(filterText||"").trim()
+                if (!q || (Fuzzy.isPathLike(q) && q.indexOf('/')!==-1)) root.rebuildDisplay()
+                // If in search mode, keep search results; browsing entries are still updated for later
+            }
         }
     }
 
-    // ---- Global index (fd) ----
-    function ensureGlobalIndex() {
-        if (globalIndexReady || globalIndexLoading) return
-        // Only build if fd exists
-        globalIndexLoading = true
-        // Build index limited to HOME, include hidden, files + dirs, max 80k
-        var cmd = ""
-        cmd += "if ! command -v fd >/dev/null 2>&1; then find " + Util.shellQuote(home) + " -mindepth 1 \\( -type f -o -type d \\) -print 2>/dev/null | head -n 80000; exit 0; fi; "
-        cmd += "fd -H -a --type f --type d . " + Util.shellQuote(home) + " 2>/devNull || fd -H -a --type f --type d . " + Util.shellQuote(home) + " 2>/dev/null | head -n 80000"
-        // Note: use correct redirect — we handled typo above; fix fallback
-        cmd = "if ! command -v fd >/dev/null 2>&1; then find " + Util.shellQuote(home) + " -mindepth 1 \\( -type f -o -type d \\) -print 2>/dev/null | head -n 80000; else fd -H -a --type f --type d . " + Util.shellQuote(home) + " 2>/dev/null | head -n 80000; fi"
-        globalIndexProc.command = ["bash","-lc", cmd]
-        globalIndexProc.running = true
+    // ---- Search (on-demand, debounced) ----
+    Timer {
+        id: searchDebounce
+        interval: 150
+        repeat: false
+        onTriggered: root.performSearch(pendingSearchQuery)
+    }
+
+    function performSearch(query) {
+        var q = String(query||"").trim()
+        if (!q) { isSearching = false; rebuildDisplay(); return }
+        // If query is path-like, don't do global search - handle via rebuildDisplay
+        if (Fuzzy.isPathLike(q) && q.indexOf('/') !== -1) { isSearching = false; rebuildDisplay(); return }
+        // Don't search for very short queries (1 char) - just filter current dir
+        if (q.length < 2) { isSearching = false; rebuildDisplay(); return }
+        isSearching = true
+        // Show transient searching state
+        displayModel.clear()
+        displayModel.append({name:"Searching…", path:"", isDir:false, detail:"", hidden:false})
+        cursorActive = false
+        var quotedHome = Util.shellQuote(home)
+        var quotedPattern = Util.shellQuote(q)
+        // Use fd with full-path, fixed strings, case-insensitive, hidden, no-ignore, absolute
+        var cmd = "if command -v fd >/dev/null 2>&1; then fd -u -a -p --max-results 120 -i -F -- " + quotedPattern + " " + quotedHome + " 2>/dev/null | head -n 120; else find " + quotedHome + " -mindepth 1 -iname " + Util.shellQuote("*"+q+"*") + " -print 2>/dev/null | head -n 120; fi"
+        searchProc.command = ["bash","-lc", cmd]
+        searchProc.running = true
     }
 
     Process {
-        id: globalIndexProc
-        property string collected: ""
-        stdout: SplitParser { onRead: function(l){ globalIndexProc.collected += l + "\n" } }
-        onStarted: collected = ""
-        onExited: function(c){
-            var lines = String(collected||"").split("\n")
-            var out = []
+        id: searchProc
+        stdout: StdioCollector { id: searchOutput; waitForEnd: true }
+        onExited: function(code){
+            isSearching = false
+            if (!root.opened) return
+            // If filter has changed since we started, ignore stale result
+            var currentQ = String(filterText||"").trim()
+            if (currentQ !== pendingSearchQuery) return
+            var raw = String(searchOutput.text||"").trim()
+            if (!raw) {
+                // No results - show empty with hint, keep browsing entries as fallback
+                displayModel.clear()
+                // Also include current dir fuzzy matches as fallback
+                var fallback = []
+                for (var fi=0; fi<dirEntries.length; fi++){
+                    var e = dirEntries[fi]
+                    if (!showHidden && e.hidden) continue
+                    if (Fuzzy.fuzzyScore(currentQ, e.path) >=0) fallback.push(e)
+                }
+                fallback.sort(function(a,b){
+                    var sa = Fuzzy.fuzzyScore(currentQ, a.path) + frecencyScore(a.path)
+                    var sb = Fuzzy.fuzzyScore(currentQ, b.path) + frecencyScore(b.path)
+                    return sb - sa
+                })
+                for (var fbi=0; fbi<fallback.length && fbi<30; fbi++){
+                    var fe = fallback[fbi]
+                    displayModel.append({name: fe.name + (fe.isDir?"/":""), path: fe.path, isDir: fe.isDir, detail: tildeCollapse(fe.path), hidden: fe.hidden})
+                }
+                if (displayModel.count===0) {
+                    // keep empty, rebuildDisplay will show "No results"
+                } else {
+                    selectedIndex = 0; cursorActive = true
+                }
+                layoutSerial++
+                if (displayModel.count>0) Qt.callLater(function(){ resultList.positionViewAtIndex(selectedIndex, ListView.Contain) })
+                return
+            }
+            var lines = raw.split("\n")
+            var candidates = []
             for (var i=0;i<lines.length;i++){
                 var p = String(lines[i]||"").trim()
                 if (!p) continue
-                // fd with -a gives absolute? With . and home, it gives absolute? Ensure absolute
-                // fd . $HOME produces relative? Actually fd . $HOME with base $HOME gives just names relative. We used fd . $HOME absolute? fd -a . $HOME with -a should be absolute.
-                // If relative, prefix home
+                // Ensure absolute
                 if (p.charAt(0) !== "/") {
                     if (p.indexOf("./")===0) p = p.slice(2)
                     p = home + "/" + p
                 }
-                // quick dir detection: try to infer via trailing slash? fd doesn't append slash for dirs, but we can keep as is and later stat? For now keep path, infer isDir via filesystem? Leave isDir false, we will enhance later via stat if needed, but for search we don't need isDir immediately — we can lazy stat on activate.
-                // To get isDir, we could have fd use - exec stat? Not needed now — we'll treat all as potential files and check on open.
-                out.push(p)
+                if (!showHidden && isHiddenName(Fuzzy.basename(p))) continue
+                candidates.push(p)
             }
-            // Also add directories themselves? fd already includes dirs.
-            globalPaths = out
-            globalIndexReady = true
-            globalIndexLoading = false
-            if (root.opened && root.filterText) root.rebuildDisplay()
-            // debounce rebuild for browse frecency boost
-            if (root.opened && !root.filterText) root.rebuildDisplay()
+            // Also add current dir entries that match fuzzily but weren't in fd results (fd is substring, fuzzy may find more)
+            for (var ci=0; ci<dirEntries.length; ci++){
+                var de = dirEntries[ci]
+                if (!showHidden && de.hidden) continue
+                if (candidates.indexOf(de.path) !== -1) continue
+                if (Fuzzy.fuzzyScore(currentQ, de.path) >=0) candidates.push(de.path)
+            }
+            // Score with fuzzy + frecency
+            var scored = []
+            for (var si=0; si<candidates.length; si++){
+                var cp = candidates[si]
+                var s = Fuzzy.fuzzyScore(currentQ, cp)
+                if (s < 0) continue
+                s += frecencyScore(cp)
+                scored.push({path: cp, score: s})
+            }
+            scored.sort(function(a,b){
+                if (b.score !== a.score) return b.score - a.score
+                if (a.path.length !== b.path.length) return a.path.length - b.path.length
+                return a.path.localeCompare(b.path)
+            })
+            displayModel.clear()
+            var limit = Math.min(scored.length, 100)
+            for (var si2=0; si2<limit; si2++){
+                var spath = scored[si2].path
+                var isDirFlag = spath.charAt(spath.length-1) === "/"
+                if (!isDirFlag) {
+                    for (var dk=0; dk<dirEntries.length; dk++) if (dirEntries[dk].path === spath) { isDirFlag = dirEntries[dk].isDir; break }
+                    // heuristic: if many candidates start with spath + "/", it's a dir
+                    if (!isDirFlag) {
+                        for (var gk=0; gk<candidates.length; gk++) if (candidates[gk].indexOf(spath + "/") === 0) { isDirFlag = true; break }
+                    }
+                }
+                var dname = Fuzzy.basename(spath)
+                if (isDirFlag) {
+                    if (dname === "") dname = spath
+                    dname += "/"
+                    if (spath.charAt(spath.length-1) !== "/") spath += "/"
+                }
+                displayModel.append({name: dname, path: spath, isDir: isDirFlag, detail: tildeCollapse(spath), hidden: isHiddenName(Fuzzy.basename(spath))})
+            }
+            layoutSerial++
+            if (displayModel.count===0) { selectedIndex=0; cursorActive=false }
+            else { selectedIndex=0; cursorActive=true }
+            Qt.callLater(function(){ if (displayModel.count>0) resultList.positionViewAtIndex(selectedIndex, ListView.Contain) })
         }
     }
 
     // ---- Search / browse decision ----
     function rebuildDisplay() {
-        displayModel.clear()
+        // If we're in debounced search mode, let performSearch handle display
         var q = String(filterText||"").trim()
+        if (isSearching) return
+        // If query is non-empty, non-path, >=2 chars and not yet searched, we should be in search - but if we are here via direct call (e.g., initial), handle via performSearch
+        if (q && !Fuzzy.isPathLike(q) || (Fuzzy.isPathLike(q) && q.indexOf('/')===-1)) {
+            if (q.length >= 2 && !isPathLikeForSearch(q)) {
+                // This branch is for search - but setFilter already handles debounce; if we reach here directly (e.g., refreshDir), we still want to trigger search
+                // Only trigger if pendingSearchQuery doesn't match
+                if (pendingSearchQuery !== q) {
+                    pendingSearchQuery = q
+                    searchDebounce.restart()
+                    return
+                }
+            }
+        }
+        // Fall through to browse/path handling below (for empty or path-like)
+        displayModel.clear()
         var qLower = q.toLowerCase()
 
-        // Path-like direct handling: if q looks like an absolute or ~ path and we can resolve its parent dir listing, show that.
         var isPathInput = Fuzzy.isPathLike(q) && q.length > 1
-        // If q is exactly a dir path and exists, show its contents? But we don't know existence sync; we handle on Enter.
-        // For live, if q contains '/', treat as path filter:
+
         if (isPathInput && q.indexOf('/') !== -1) {
             var expanded = expandPath(q)
-            // Determine base dir and prefix
             var base = expanded
             var prefix = ""
-            // If expanded ends with '/' then base is dir, prefix empty
             if (expanded.charAt(expanded.length-1) === "/") {
                 base = expanded.slice(0,-1) || "/"
                 prefix = ""
@@ -342,21 +442,15 @@ Item {
             }
             if (!base) base = "."
             base = normalizeDir(base)
-            // Try to list base via sync? Instead, if base === currentDir, filter dirEntries
-            // If base differs, we could run a one-off ls for base (async). For now, if base != currentDir, show filtered globalPaths that start with base?
-            // Simple: if base exists in dirEntries parent, filter globalPaths for prefix.
-            // We'll do: if base === currentDir, filter dirEntries by prefix
             if (base === currentDir) {
                 var filtered = []
                 for (var di=0; di<dirEntries.length; di++) {
                     var e = dirEntries[di]
                     if (prefix && e.name.toLowerCase().indexOf(prefix.toLowerCase()) !== 0) {
-                        // also fuzzy within name?
                         if (Fuzzy.fuzzyScore(prefix, e.name) < 0) continue
                     }
                     filtered.push(e)
                 }
-                // Sort: dirs first, then frecency
                 filtered.sort(function(a,b){
                     if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
                     var sa = frecencyScore(a.path), sb = frecencyScore(b.path)
@@ -373,49 +467,11 @@ Item {
                         hidden: fe.hidden
                     })
                 }
-                // Also if prefix empty, we already show all; if no results, show global path matches for expanded?
-                if (displayModel.count===0) {
-                    // fallback to global filter on expanded
-                    var gfiltered = Fuzzy.scoreAndSort(globalPaths, expanded, 30)
-                    for (var gi=0; gi<gfiltered.length; gi++) {
-                        var gp = gfiltered[gi]
-                        var isD = gp.charAt(gp.length-1) === "/"
-                        displayModel.append({name: Fuzzy.basename(gp) + (isD?"/":""), path:gp, isDir:isD, detail: tildeCollapse(gp), hidden: isHiddenName(Fuzzy.basename(gp))})
-                    }
+                if (displayModel.count===0 && !isSearching) {
+                    displayModel.append({name:"No match", path:"", isDir:false, detail:"Try a different prefix or check hidden (Ctrl+H)", hidden:false})
                 }
             } else {
-                // Base is different directory — show a single row to navigate there + global matches
-                // First row: go to base
                 displayModel.append({name: Fuzzy.basename(base) + "/", path: normalizeDir(base) + "/", isDir:true, detail: tildeCollapse(normalizeDir(base)), hidden:false})
-                // Then entries under base that match prefix via globalPaths
-                var wantPrefix = base + "/" + prefix
-                var matches = []
-                for (var mi=0; mi<globalPaths.length; mi++) {
-                    var mp = globalPaths[mi]
-                    if (mp.indexOf(wantPrefix) === 0 || Fuzzy.fuzzyScore(q, mp) >=0) {
-                        // only include those under base if prefix provided
-                        if (prefix && mp.toLowerCase().indexOf(wantPrefix.toLowerCase())!==0) {
-                            // check fuzzy inside
-                            if (Fuzzy.fuzzyScore(prefix, Fuzzy.basename(mp))<0) continue
-                            if (mp.indexOf(base) !== 0) continue
-                        }
-                        matches.push(mp)
-                        if (matches.length>=80) break
-                    }
-                }
-                // score sort for fuzzy
-                var scored = []
-                for (var si=0; si<matches.length; si++) scored.push({p:matches[si], s:Fuzzy.fuzzyScore(q, matches[si])})
-                scored.sort(function(a,b){ return b.s - a.s })
-                for (var sj=0; sj<scored.length && displayModel.count<100; sj++) {
-                    var sp = scored[sj].p
-                    var isDir2 = false
-                    // heuristic: if path exists as dir in globalPaths with children, it's dir — but we treat all as file unless we know. We'll check via existence of any child.
-                    // For now, treat as file/dir via stat not available; use trailing slash if originally dir? fd dirs not slash-terminated, so we can't know. We'll mark as dir if any other path starts with sp + "/"
-                    for (var chk=0; chk<globalPaths.length; chk++) if (globalPaths[chk].indexOf(sp + "/")===0) { isDir2=true; break; }
-                    if (isDir2 && sp.charAt(sp.length-1) !== "/") sp += "/"
-                    displayModel.append({name: Fuzzy.basename(sp) + (isDir2?"/":""), path:sp, isDir:isDir2, detail: tildeCollapse(sp), hidden:isHiddenName(Fuzzy.basename(sp))})
-                }
             }
             layoutSerial += 1
             if (displayModel.count>0) { selectedIndex = Math.min(selectedIndex, displayModel.count-1); cursorActive=true } else { selectedIndex=0; cursorActive=false }
@@ -424,20 +480,15 @@ Item {
         }
 
         if (!q) {
-            // Browse mode
             var sorted = dirEntries.slice(0)
-            // Sort dirs first, then frecency, then name
             sorted.sort(function(a,b){
                 if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
                 var sa = frecencyScore(a.path), sb = frecencyScore(b.path)
                 if (Math.abs(sb-sa) > 0.1) return sb - sa
-                // hidden last? but showHidden toggles visibility already
                 return a.name.toLowerCase().localeCompare(b.name.toLowerCase())
             })
-            // If frecency has entries not in current dir, maybe inject top frequent within HOME? But spec says no dashboard — we keep it clean: only current dir + frecency boost.
             for (var bi=0; bi<sorted.length; bi++) {
                 var be = sorted[bi]
-                // respect hidden already
                 displayModel.append({
                     name: be.name + (be.isDir?"/":""),
                     path: be.path,
@@ -446,81 +497,51 @@ Item {
                     hidden: be.hidden
                 })
             }
-            // If empty dir, show parent hint? Not needed.
         } else {
-            // Search mode: fuzzy across globalPaths + current dir entries
-            var candidates = []
-            // Add global paths scored
-            var globalFiltered = Fuzzy.scoreAndSort(globalPaths, q, 120)
-            // Also ensure current dir entries are included even if not in global index yet (new files)
-            var currentPaths = []
-            for (var ci=0; ci<dirEntries.length; ci++) currentPaths.push(dirEntries[ci].path)
-            var combined = globalFiltered.slice(0)
-            // Merge current dir not already in global filtered
-            for (var cii=0; cii<currentPaths.length; cii++) {
-                var cp = currentPaths[cii]
-                if (combined.indexOf(cp)===-1 && Fuzzy.fuzzyScore(q, cp)>=0) combined.push(cp)
-                if (combined.length>=150) break
-            }
-            // Score again with frecency boost
-            var scoredAll = []
-            for (var ai=0; ai<combined.length; ai++) {
-                var ap = combined[ai]
-                var baseScore = Fuzzy.fuzzyScore(q, ap)
-                if (baseScore <0) continue
-                var fScore = frecencyScore(ap)
-                var total = baseScore + fScore
-                // Boost if hidden and showHidden false? Actually filtered earlier? globalPaths includes hidden always, but we respect showHidden now:
-                if (!showHidden && isHiddenName(Fuzzy.basename(ap))) continue
-                scoredAll.push({path:ap, score:total})
-            }
-            // Also include dirEntries fuzzy for fresh entries not in globalPaths
-            for (var di2=0; di2<dirEntries.length; di2++) {
-                var de = dirEntries[di2]
-                if (!showHidden && de.hidden) continue
-                var already = false
-                for (var sca=0; sca<scoredAll.length; sca++) if (scoredAll[sca].path === de.path) { already=true; break; }
-                if (already) continue
-                var s2 = Fuzzy.fuzzyScore(q, de.path)
-                if (s2>=0) scoredAll.push({path:de.path, score:s2+frecencyScore(de.path)})
-            }
-            scoredAll.sort(function(a,b){
-                if (b.score!==a.score) return b.score - a.score
-                if (a.path.length!==b.path.length) return a.path.length - b.path.length
-                return a.path.localeCompare(b.path)
-            })
-            var limit = 100
-            for (var si2=0; si2<scoredAll.length && si2<limit; si2++) {
-                var spath = scoredAll[si2].path
-                // Determine isDir: check if any dirEntries knows, or global has children, or path ends with /
-                var isDirFlag = spath.charAt(spath.length-1)==="/"
-                if (!isDirFlag) {
-                    for (var dk=0; dk<dirEntries.length; dk++) if (dirEntries[dk].path===spath) { isDirFlag=dirEntries[dk].isDir; break; }
-                    if (!isDirFlag) {
-                        for (var gk=0; gk<globalPaths.length; gk++) if (globalPaths[gk].indexOf(spath + "/")===0) { isDirFlag=true; break; }
-                        // Also check via tilde? Not needed
-                        // For files that are actually dirs but not yet known, we will lazy stat on open: but for display we guess.
-                        // If still unknown, we could mark as dir if fs stat says? We'll leave as file and correct on activate via stat check.
-                    }
+            // Small query (<2 chars) or non-path fuzzy on current dir only (no global)
+            if (q.length < 2) {
+                var smallFiltered = []
+                for (var si=0; si<dirEntries.length; si++){
+                    var se = dirEntries[si]
+                    if (!showHidden && se.hidden) continue
+                    if (Fuzzy.fuzzyScore(q, se.name) >=0 || se.name.toLowerCase().indexOf(qLower) !== -1) smallFiltered.push(se)
                 }
-                var displayName = Fuzzy.basename(spath)
-                if (isDirFlag) {
-                    if (displayName==="") displayName = spath
-                    displayName += "/"
-                    if (spath.charAt(spath.length-1) !== "/") spath += "/"
-                }
-                var detail = tildeCollapse(spath)
-                // For files, detail is parent dir; for dirs, detail is its own path? Show parent for both but dim
-                // If search result is dir, show its path as detail; if file, show parent dir
-                displayModel.append({
-                    name: displayName,
-                    path: spath,
-                    isDir: isDirFlag,
-                    detail: detail,
-                    hidden: isHiddenName(Fuzzy.basename(spath))
+                smallFiltered.sort(function(a,b){
+                    var sA = Fuzzy.fuzzyScore(q, a.name) + frecencyScore(a.path)
+                    var sB = Fuzzy.fuzzyScore(q, b.name) + frecencyScore(b.path)
+                    return sB - sA
                 })
+                for (var sfi=0; sfi<smallFiltered.length && sfi<50; sfi++){
+                    var sfe = smallFiltered[sfi]
+                    displayModel.append({name: sfe.name + (sfe.isDir?"/":""), path: sfe.path, isDir: sfe.isDir, detail: tildeCollapse(sfe.path), hidden: sfe.hidden})
+                }
+                if (displayModel.count===0) displayModel.append({name:"No results", path:"", isDir:false, detail:'Type more characters for global search', hidden:false})
+            } else {
+                // For longer queries, we should have triggered search via debounce - but if we are here without search, fallback to local fuzzy
+                var localFiltered = []
+                for (var li=0; li<dirEntries.length; li++){
+                    var le = dirEntries[li]
+                    if (!showHidden && le.hidden) continue
+                    if (Fuzzy.fuzzyScore(q, le.path) >=0) localFiltered.push(le)
+                }
+                localFiltered.sort(function(a,b){
+                    var sA2 = Fuzzy.fuzzyScore(q, a.path) + frecencyScore(a.path)
+                    var sB2 = Fuzzy.fuzzyScore(q, b.path) + frecencyScore(b.path)
+                    return sB2 - sA2
+                })
+                for (var lfi=0; lfi<localFiltered.length && lfi<50; lfi++){
+                    var lfe = localFiltered[lfi]
+                    displayModel.append({name: lfe.name + (lfe.isDir?"/":""), path: lfe.path, isDir: lfe.isDir, detail: tildeCollapse(lfe.path), hidden: lfe.hidden})
+                }
+                // If no local results, trigger global search now (if not already)
+                if (displayModel.count===0) {
+                    pendingSearchQuery = q
+                    searchDebounce.restart()
+                    displayModel.clear()
+                    displayModel.append({name:"Searching…", path:"", isDir:false, detail:"", hidden:false})
+                    cursorActive=false
+                }
             }
-            // If no results, show a hint row? Keep empty and show "No results"
         }
 
         layoutSerial += 1
@@ -530,6 +551,10 @@ Item {
         else if (!cursorActive && displayModel.count>0) { cursorActive=true }
 
         Qt.callLater(function(){ if (displayModel.count>0) resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain) })
+    }
+
+    function isPathLikeForSearch(q) {
+        return Fuzzy.isPathLike(q) && q.indexOf('/') !== -1
     }
 
     property int layoutSerial: 0
@@ -556,8 +581,26 @@ Item {
         root.selectedIndex = 0
         root.cursorActive = true
         root.disarmPointer()
-        // debounce search: rebuild immediately for browse, slight delay for global?
-        root.rebuildDisplay()
+        var q = String(next||"").trim()
+        // Path-like or empty: immediate rebuild (browse)
+        if (!q || (Fuzzy.isPathLike(q) && q.indexOf('/') !== -1)) {
+            if (searchProc.running) searchProc.running = false
+            searchDebounce.stop()
+            isSearching = false
+            root.rebuildDisplay()
+        } else if (q.length < 2) {
+            // Short query: local only, immediate
+            if (searchProc.running) searchProc.running = false
+            searchDebounce.stop()
+            isSearching = false
+            root.rebuildDisplay()
+        } else {
+            // Longer query: debounced global search
+            pendingSearchQuery = q
+            searchDebounce.restart()
+            // Optimistically show local matches immediately, then global will replace
+            root.rebuildDisplay()
+        }
     }
 
     function disarmPointer(){ pointerGate.reset() }
@@ -895,8 +938,7 @@ Item {
                         return
                     }
                     if (event.key === Qt.Key_Escape) {
-                        if (root.filterText) { root.setFilter("") }
-                        else { root.dismiss() }
+                        root.dismiss()
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_C) {
                         // Copy path of selected
@@ -1013,7 +1055,7 @@ Item {
                     Text {
                         textFormat: Text.PlainText
                         width: parent.width
-                        text: tildeCollapse(currentDir) + (showHidden ? "" : "  • hidden hidden") + (globalIndexLoading ? "  • indexing…" : "")
+                        text: tildeCollapse(currentDir) + (showHidden ? "" : "  • hidden hidden") + (isSearching ? "  • searching…" : "")
                         color: root.foreground
                         opacity: 0.55
                         font.family: root.fontFamily
