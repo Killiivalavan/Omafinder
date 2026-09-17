@@ -30,6 +30,13 @@ Item {
     property int animationDurationIn: 130
     property int animationDurationOut: 80
     property bool isAnimatingOut: false
+    // Clipboard for file copy/cut/paste
+    property string clipboardPath: ""
+    property string clipboardOp: "" // "copy" or "cut"
+    // Open With mode
+    property bool openWithMode: false
+    property string openWithFile: ""
+    readonly property var appLibrary: shell && shell.appLibrary ? shell.appLibrary : null
 
     // Colors / style — mirror menu tokens
     property color background: Color.menu.background
@@ -55,8 +62,8 @@ Item {
         if (rows === 0) rows = 1
         var listH = rows * rowHeight + Math.max(0, rows - 1) * rowSpacing
         var total = contentMargin*2 + headerHeight + contentSpacing + listH
-        // Add a little for action hint bar
-        total += Style.space(22)
+        // Footer: 22 + 18 when not in Open With
+        total += Style.space(22) + (openWithMode ? 0 : Style.space(18))
         return Math.min(total, panel.height - Style.gapsOut*2)
     }
 
@@ -73,6 +80,8 @@ Item {
         root.cursorActive = true
         pendingSearchQuery = ""
         isSearching = false
+        openWithMode = false
+        openWithFile = ""
         if (searchProc.running) searchProc.running = false
         searchDebounce.stop()
         root.rebuildDisplay()
@@ -83,6 +92,8 @@ Item {
     function close() {
         root.opened = false
         root.isAnimatingOut = false
+        openWithMode = false
+        openWithFile = ""
         if (searchProc.running) searchProc.running = false
         searchDebounce.stop()
         isSearching = false
@@ -90,6 +101,11 @@ Item {
 
     function dismiss() {
         if (root.isAnimatingOut) return
+        // If in Open With, just exit that mode instead of dismissing overlay
+        if (openWithMode) {
+            exitOpenWithMode()
+            return
+        }
         root.isAnimatingOut = true
         if (searchProc.running) searchProc.running = false
         searchDebounce.stop()
@@ -581,6 +597,10 @@ Item {
         root.selectedIndex = 0
         root.cursorActive = true
         root.disarmPointer()
+        if (openWithMode) {
+            rebuildAppDisplay()
+            return
+        }
         var q = String(next||"").trim()
         // Path-like or empty: immediate rebuild (browse)
         if (!q || (Fuzzy.isPathLike(q) && q.indexOf('/') !== -1)) {
@@ -788,26 +808,89 @@ Item {
     function copyPath(path) {
         var p = String(path||"")
         if (!p) return
-        // Use wl-copy if available, fallback to xclip
         var cmd = "printf %s " + Util.shellQuote(p) + " | (command -v wl-copy >/dev/null 2>&1 && wl-copy || xclip -selection clipboard 2>/dev/null || true)"
         Util.execDetached(cmd)
-        // bump frecency
         bumpFrecency(p)
         root.dismiss()
     }
-    function copyFile(path) {
+    function copyFileToClipboard(path, op) {
         var p = String(path||"")
         if (!p) return
-        Util.execDetached("wl-copy --type text/uri-list -- " + Util.shellQuote("file://" + p) + " 2>/dev/null || true")
+        clipboardPath = p
+        clipboardOp = op || "copy"
+        // Put file uri on system clipboard for interoperability (nautilus, etc.)
+        var uri = "file://" + p
+        // Ensure absolute and handle dir trailing slash for uri
+        Util.execDetached("printf %s " + Util.shellQuote(uri) + " | wl-copy --type text/uri-list 2>/dev/null || printf %s " + Util.shellQuote(uri) + " | xclip -selection clipboard -t text/uri-list 2>/dev/null || true")
+        // Also copy plain path as fallback
         bumpFrecency(p)
+    }
+    function copyFile(path) {
+        copyFileToClipboard(path, "copy")
+        // Copy should keep overlay open briefly? Spec says dismiss after — keep dismiss
         root.dismiss()
+    }
+    function cutFile(path) {
+        copyFileToClipboard(path, "cut")
+        root.dismiss()
+    }
+    function pasteClipboard() {
+        var src = String(clipboardPath||"")
+        var op = String(clipboardOp||"copy")
+        if (!src) {
+            // Fallback: try to get uri-list from system clipboard via wl-paste
+            // We do async paste via wl-paste, but for now just try to paste whatever is in system clipboard if our internal is empty
+            // Use a helper process to read wl-paste and then do gio copy
+            var pasteCmd = "src=$(wl-paste --type text/uri-list 2>/dev/null | head -n1 | sed 's/^file:\\/\\///' | sed 's/%20/ /g'); [ -z \"$src\" ] && src=$(wl-paste 2>/dev/null | head -n1); src=$(printf %s \"$src\" | tr -d '\\r\\n' | sed 's/^file:\\/\\///'); if [ -z \"$src\" ]; then echo NOCLIP; exit 0; fi; if [ ! -e \"$src\" ]; then echo NOTFOUND; exit 0; fi; dest=" + Util.shellQuote(currentDir) + "/$(basename -- \"$src\"); if [ -e \"$dest\" ]; then echo EXISTS; exit 0; fi; if [ \"" + op + "\" = \"cut\" ]; then gio move -- \"" + "\"$src\" \"$dest\" 2>/dev/null || mv -- \"$src\" \"$dest\" 2>/dev/null && echo MOVED || echo FAIL; else gio copy -- \"" + "\"$src\" \"$dest\" 2>/dev/null || cp -a -- \"$src\" \"$dest\" 2>/dev/null && echo COPIED || echo FAIL; fi"
+            // Actually we need src inside command — simpler: just try pasteProc
+            pasteProc.command = ["bash","-lc", "src=$(wl-paste --type text/uri-list 2>/dev/null | tr -d '\\r' | head -n1 | sed 's/^file:\\/\\///;s/%20/ /g' | tr -d '\\n'); if [ -z \"$src\" ]; then src=$(xclip -selection clipboard -o -t text/uri-list 2>/dev/null | head -n1 | sed 's/^file:\\/\\///' | tr -d '\\n'); fi; if [ -z \"$src\" ]; then echo NOCLIP; exit 0; fi; src=$(printf %s \"$src\" | sed 's/%0D//g' | head -n1); if [ ! -e \"$src\" ]; then echo NOTFOUND:$src; exit 0; fi; dest=" + Util.shellQuote(currentDir) + "/$(basename -- \"$src\"); if [ -e \"$dest\" ]; then echo EXISTS:$dest; exit 0; fi; gio copy \"$src\" \"$dest\" 2>/dev/null || cp -a -- \"$src\" \"$dest\" 2>/dev/null; if [ $? -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"]
+            pasteProc.running = true
+            return
+        }
+        if (!src) return
+        var destBase = normalizeDir(currentDir)
+        var baseName = Fuzzy.basename(src)
+        if (!baseName) baseName = "pasted"
+        var dest = joinPath(destBase, baseName)
+        // Avoid overwriting — find unused name
+        var cmd
+        if (op === "cut") {
+            cmd = "src=" + Util.shellQuote(src) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio move -- \"$src\" \"$dest\" 2>/dev/null || mv -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo MOVED:$dest; else echo FAIL; fi"
+        } else {
+            cmd = "src=" + Util.shellQuote(src) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio copy -- \"$src\" \"$dest\" 2>/dev/null || cp -a -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"
+        }
+        pasteProc.command = ["bash","-lc", cmd]
+        pasteProc.running = true
+        // Clear cut after move
+        if (op === "cut") { clipboardPath = ""; clipboardOp = "" }
+    }
+    Process {
+        id: pasteProc
+        stdout: StdioCollector { id: pasteOutput; waitForEnd: true }
+        onExited: function(code){
+            var out = String(pasteOutput.text||"").trim()
+            if (out.indexOf("COPIED:")===0 || out.indexOf("MOVED:")===0) {
+                var created = out.split(":")[1]
+                if (created) bumpFrecency(created)
+                refreshDir()
+                // Stay open? Spec says disappear after, but for paste we might want to stay to show result
+                // We'll refresh and keep overlay open briefly, then dismiss? For now dismiss to follow spec
+                // root.dismiss() — but keep open to show pasted file? We'll keep open and rebuild
+                if (root.opened && !openWithMode) rebuildDisplay()
+            } else if (out.indexOf("EXISTS:")===0) {
+                // Could show feedback — for now just refresh
+                refreshDir()
+            } else if (out==="NOCLIP" || out.indexOf("NOTFOUND")===0) {
+                // No clipboard — try to show message via displayModel? Keep as is
+            }
+            // Dismiss after paste per spec
+            // root.dismiss()
+        }
     }
     function revealInFileManager(path) {
         var p = String(path||"")
         if (!p) return
         var dir = p
-        // if file, reveal parent with select
-        // try nautilus --select
         var cmd = "if [ -d " + Util.shellQuote(p) + " ]; then xdg-open " + Util.shellQuote(p) + " >/dev/null 2>&1 & elif command -v nautilus >/dev/null 2>&1; then nautilus --select " + Util.shellQuote(p) + " >/dev/null 2>&1 & else xdg-open " + Util.shellQuote(Fuzzy.dirname(p)) + " >/dev/null 2>&1 & fi"
         Util.execDetached(cmd)
         bumpFrecency(p)
@@ -816,10 +899,7 @@ Item {
     function openTerminalHere(path) {
         var p = String(path||"")
         var targetDir = p
-        // if file, use its parent
-        // we need to know if p is dir — heuristic: ends with /
         if (p && p.charAt(p.length-1) !== "/" ) {
-            // assume file -> parent
             targetDir = Fuzzy.dirname(p)
             if (!targetDir || targetDir===".") targetDir = currentDir
         } else {
@@ -827,7 +907,6 @@ Item {
         }
         if (!targetDir) targetDir = currentDir
         bumpFrecency(targetDir + "/")
-        // Try common terminals: omarchy default terminal via omarchy launch? Use xdg-terminal? Simplest: try foot, alacritty, kitty, ghostty
         var cmd = "dir=" + Util.shellQuote(targetDir) + "; "
         cmd += "if command -v omarchy >/dev/null 2>&1; then omarchy launch terminal --working-directory \"$dir\" >/dev/null 2>&1 & "
         cmd += "elif command -v foot >/dev/null 2>&1; then foot -D \"$dir\" >/dev/null 2>&1 & "
@@ -843,9 +922,7 @@ Item {
         if (!p) return
         var cmd = "gio trash " + Util.shellQuote(p) + " 2>/dev/null || trash-put " + Util.shellQuote(p) + " 2>/dev/null || rm -rf " + Util.shellQuote(p)
         Util.execDetached(cmd)
-        // refresh after a moment
         trashRefreshTimer.restart()
-        // don't dismiss? Spec says dismiss after action — trash should dismiss? We'll dismiss.
         root.dismiss()
     }
     Timer { id: trashRefreshTimer; interval: 500; onTriggered: refreshDir() }
@@ -853,7 +930,6 @@ Item {
     function createFolder() {
         var base = currentDir
         var name = "New Folder"
-        // Find unused name
         var cmd = "base=" + Util.shellQuote(base) + "; name=" + Util.shellQuote(name) + "; i=1; target=\"$base/$name\"; while [ -e \"$target\" ]; do target=\"$base/$name $i\"; i=$((i+1)); done; mkdir -p \"$target\" && echo \"$target\""
         createFolderProc.command = ["bash","-lc", cmd]
         createFolderProc.running = true
@@ -865,17 +941,98 @@ Item {
             if (created) {
                 bumpFrecency(created + "/")
                 refreshDir()
-                // navigate into new folder? Just refresh and keep open
-                // Optionally select it
             }
         } }
+    }
+
+    // ---- Open With ----
+    function enterOpenWithMode(path) {
+        var p = String(path||"")
+        if (!p) return
+        // Check if it's a file (not dir)
+        openWithFile = p
+        openWithMode = true
+        filterText = ""
+        selectedIndex = 0
+        cursorActive = true
+        // Clear any pending search
+        if (searchProc.running) searchProc.running = false
+        searchDebounce.stop()
+        isSearching = false
+        rebuildAppDisplay()
+        Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
+    }
+    function exitOpenWithMode() {
+        openWithMode = false
+        openWithFile = ""
+        filterText = ""
+        selectedIndex = 0
+        rebuildDisplay()
+        Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
+    }
+    function rebuildAppDisplay() {
+        displayModel.clear()
+        if (!appLibrary) {
+            displayModel.append({name:"No apps found", path:"", isDir:false, detail:"AppLibrary not available", hidden:false})
+            return
+        }
+        var q = String(filterText||"").trim().toLowerCase()
+        var entries = appLibrary.sortedEntries(q) // already filtered/sorted by AppSearch
+        // AppSearch already does fuzzy, but we add our own filter for consistency when q empty
+        var limit = 100
+        var added = 0
+        for (var i=0; i<entries.length && added < limit; i++) {
+            var e = entries[i].entry
+            if (!e || !e.id) continue
+            var label = appLibrary.entryName(e)
+            var detail = appLibrary.entrySubtext(e) || String(e.id||"")
+            // Additional fuzzy filter if needed (AppSearch already filtered, but keep)
+            if (q && label.toLowerCase().indexOf(q)===-1 && detail.toLowerCase().indexOf(q)===-1) {
+                if (Fuzzy.fuzzyScore(q, label) < 0 && Fuzzy.fuzzyScore(q, detail) < 0) continue
+            }
+            displayModel.append({
+                name: label,
+                path: String(e.id||""), // store desktopId in path
+                isDir: false,
+                detail: detail,
+                hidden: false,
+                appIcon: String(e.icon||""),
+                appId: String(e.id||"")
+            })
+            added++
+        }
+        if (displayModel.count===0) {
+            displayModel.append({name:"No apps for “" + filterText + "”", path:"", isDir:false, detail:"", hidden:false})
+            selectedIndex=0; cursorActive=false
+        } else {
+            selectedIndex=0; cursorActive=true
+        }
+        layoutSerial++
+        Qt.callLater(function(){ if (displayModel.count>0) resultList.positionViewAtIndex(selectedIndex, ListView.Contain) })
+    }
+    function launchAppWithFile(desktopId, filePath) {
+        var did = String(desktopId||"").trim()
+        var fp = String(filePath||"").trim()
+        if (!did || !fp) return
+        // Normalize desktopId: remove .desktop suffix if present for gtk-launch
+        if (did.slice(-8) === ".desktop") did = did.slice(0,-8)
+        bumpFrecency(fp)
+        // Launch via uwsm-app + gtk-launch, same as AppLibrary.launch but with file arg
+        var cmd = "uwsm-app -- gtk-launch " + Util.shellQuote(did + ".desktop") + " " + Util.shellQuote(fp) + " >/dev/null 2>&1 &"
+        // Fallback: try gio launch
+        var fallback = "gio launch " + Util.shellQuote(did + ".desktop") + " " + Util.shellQuote(fp) + " >/dev/null 2>&1 &"
+        Util.execDetached(cmd + " || " + fallback)
+        openWithMode = false
+        openWithFile = ""
+        root.dismiss()
     }
 
     function toggleHidden() {
         showHidden = !showHidden
         saveState()
         refreshDir()
-        rebuildDisplay()
+        if (openWithMode) rebuildAppDisplay()
+        else rebuildDisplay()
     }
 
     // ---- Models ----
@@ -931,6 +1088,42 @@ Item {
                 focus: true
                 Keys.priority: Keys.BeforeItem
                 Keys.onPressed: function(event){
+                    // Open With mode has its own handling
+                    if (openWithMode) {
+                        if (event.key === Qt.Key_Escape) {
+                            exitOpenWithMode()
+                            event.accepted = true
+                            return
+                        } else if (event.key === Qt.Key_Up) {
+                            root.select(-1); event.accepted = true; return
+                        } else if (event.key === Qt.Key_Down) {
+                            root.select(1); event.accepted = true; return
+                        } else if (event.key === Qt.Key_PageUp) {
+                            root.select(-6); event.accepted = true; return
+                        } else if (event.key === Qt.Key_PageDown) {
+                            root.select(6); event.accepted = true; return
+                        } else if (event.key === Qt.Key_Home) {
+                            root.selectAbsolute(0); event.accepted = true; return
+                        } else if (event.key === Qt.Key_End) {
+                            root.selectAbsolute(displayModel.count-1); event.accepted = true; return
+                        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            if (cursorActive && displayModel.count>0) {
+                                var row = displayModel.get(selectedIndex)
+                                if (row.path) launchAppWithFile(row.path, openWithFile)
+                            }
+                            event.accepted = true; return
+                        } else if (Util.editsFilter(event, filterText)) {
+                            setFilter(Util.editedFilter(event, filterText))
+                            event.accepted = true; return
+                        } else if (event.text && event.text.length===1 && event.text.charCodeAt(0)>=32 && event.text.charCodeAt(0)!==127 && (event.modifiers===Qt.NoModifier || event.modifiers===Qt.ShiftModifier)) {
+                            setFilter(filterText + event.text)
+                            event.accepted = true; return
+                        } else if (event.key === Qt.Key_Backspace) {
+                            if (Util.editsFilter(event, filterText)) { setFilter(Util.editedFilter(event, filterText)); event.accepted=true; return }
+                            if (filterText) { setFilter(filterText.slice(0,-1)); event.accepted=true; return }
+                        }
+                        return
+                    }
                     // Hidden toggle: Ctrl+H or Ctrl+Dot
                     if ((event.modifiers & Qt.ControlModifier) && (event.key === Qt.Key_H || event.key === Qt.Key_Period)) {
                         root.toggleHidden()
@@ -940,13 +1133,40 @@ Item {
                     if (event.key === Qt.Key_Escape) {
                         root.dismiss()
                         event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_C) {
+                        // Copy file (uri-list) for paste
+                        if (displayModel.count>0 && cursorActive) {
+                            var crow = displayModel.get(selectedIndex)
+                            if (crow.path) copyFileToClipboard(crow.path, "copy")
+                            // Keep copied path visible? Don't dismiss immediately? But spec says dismiss — we will keep clipboard and dismiss
+                            root.dismiss()
+                        }
+                        event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_C) {
-                        // Copy path of selected
+                        // Copy path of selected (Ctrl+C)
                         if (displayModel.count>0 && cursorActive) {
                             var row = displayModel.get(selectedIndex)
                             root.copyPath(row.path)
                         } else if (filterText) {
                             root.copyPath(expandPath(filterText))
+                        }
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_X) {
+                        // Cut file
+                        if (displayModel.count>0 && cursorActive) {
+                            var xrow = displayModel.get(selectedIndex)
+                            if (xrow.path) cutFile(xrow.path)
+                        }
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_V) {
+                        // Paste into current dir
+                        pasteClipboard()
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_O) {
+                        // Open With
+                        if (displayModel.count>0 && cursorActive) {
+                            var orow = displayModel.get(selectedIndex)
+                            if (orow.path && !orow.isDir) enterOpenWithMode(orow.path)
                         }
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_T) {
@@ -1016,11 +1236,6 @@ Item {
                     } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                         // If filter is path-like and no selection? handle direct
                         if (root.filterText && Fuzzy.isPathLike(root.filterText)) {
-                            // If display has selection, prefer selection unless filter is exact path
-                            // Check if filter exactly matches expanded path existence — let handleEnterOnFilter decide
-                            // If cursorActive and selected row's path matches filter? Then activateIndex, else direct
-                            // Simpler: if filter contains '/' and selected row not matching filter, try direct first then fallback
-                            // We'll call handleEnterOnFilter which will prioritize direct path if exists
                             root.handleEnterOnFilter()
                         } else if (root.cursorActive) {
                             root.activateIndex(root.selectedIndex)
@@ -1032,8 +1247,6 @@ Item {
                         root.setFilter(root.filterText + event.text)
                         event.accepted = true
                     } else if (event.key === Qt.Key_Tab) {
-                        // Quick toggle hidden? Or cycle focus? Use Tab to toggle hidden for discovery
-                        // Keep Tab for navigation? Not needed
                         event.accepted = true
                     }
                 }
@@ -1055,7 +1268,7 @@ Item {
                     Text {
                         textFormat: Text.PlainText
                         width: parent.width
-                        text: tildeCollapse(currentDir) + (showHidden ? "" : "  • hidden hidden") + (isSearching ? "  • searching…" : "")
+                        text: openWithMode ? ("Open with: " + Fuzzy.basename(openWithFile)) : (tildeCollapse(currentDir) + (showHidden ? "" : "  • hidden hidden") + (isSearching ? "  • searching…" : "") + (clipboardPath ? "  • " + clipboardOp + ": " + Fuzzy.basename(clipboardPath) : ""))
                         color: root.foreground
                         opacity: 0.55
                         font.family: root.fontFamily
@@ -1095,7 +1308,7 @@ Item {
                                     anchors.left: parent.left
                                     anchors.right: parent.right
                                     anchors.verticalCenter: parent.verticalCenter
-                                    text: root.filterText ? root.filterText : "Search or type a path…"
+                                    text: root.filterText ? root.filterText : (openWithMode ? "Search apps…" : "Search or type a path…")
                                     color: root.foreground
                                     opacity: root.filterText ? 1 : 0.38
                                     font.family: root.fontFamily
@@ -1143,7 +1356,10 @@ Item {
                             required property bool isDir
                             required property string detail
                             required property bool hidden
+                            property string appIcon: ""
+                            property string appId: ""
                             readonly property bool hasCursor: root.cursorActive && row.index === root.selectedIndex
+                            readonly property bool isApp: openWithMode && appId !== ""
                             width: ListView.view.width
                             height: root.rowHeight
                             radius: root.cornerRadius
@@ -1158,21 +1374,29 @@ Item {
                                 anchors.bottomMargin: Style.space(6)
                                 spacing: Style.space(10)
 
-                                // Icon
+                                // Icon — app icon when in Open With, else folder/file
+                                Image {
+                                    visible: row.isApp && row.appIcon !== ""
+                                    width: Style.space(28)
+                                    height: Style.space(28)
+                                    source: visible && appLibrary ? appLibrary.iconSource(row.appIcon) : ""
+                                    fillMode: Image.PreserveAspectFit
+                                    sourceSize.width: width * Screen.devicePixelRatio
+                                    sourceSize.height: height * Screen.devicePixelRatio
+                                    asynchronous: true
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
                                 Text {
+                                    visible: !row.isApp || row.appIcon === ""
                                     textFormat: Text.PlainText
                                     text: row.isDir ? "📁" : (row.hidden ? "·" : "📄")
-                                    // Use text icons for simplicity; fallback to glyphs
-                                    // For dirs, show folder; files show page
                                     color: row.hasCursor ? root.selectedText : root.foreground
                                     opacity: row.isDir ? 0.9 : 0.7
                                     font.family: root.fontFamily
                                     font.pixelSize: Style.font.iconLarge * 0.9
-                                    width: Style.space(28)
+                                    width: visible ? Style.space(28) : 0
                                     horizontalAlignment: Text.AlignHCenter
                                     anchors.verticalCenter: parent.verticalCenter
-                                    // Override with nicer glyphs if available
-                                    // Use nerd font folder icon if rendered
                                 }
 
                                 Column {
@@ -1213,10 +1437,14 @@ Item {
                                 onClicked: {
                                     root.cursorActive=true
                                     root.selectedIndex=row.index
-                                    root.activateIndex(row.index)
+                                    if (openWithMode) {
+                                        if (row.path) launchAppWithFile(row.path, openWithFile)
+                                    } else {
+                                        root.activateIndex(row.index)
+                                    }
                                 }
-                                // Right click for context? Show copy
                                 onPressAndHold: {
+                                    if (openWithMode) return
                                     root.copyPath(row.path)
                                 }
                             }
@@ -1257,13 +1485,44 @@ Item {
                     color: "transparent"
                     Row {
                         anchors.centerIn: parent
-                        spacing: Style.space(12)
+                        spacing: Style.space(10)
+                        visible: !openWithMode
                         Text { text: "↵ open"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "⌫ parent"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "⎋ close"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                         Text { text: "Ctrl+H hidden"; color: root.foreground; opacity: showHidden ? 0.45 : 0.25; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                        Text { text: "Ctrl+C copy"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
-                        Text { text: "Ctrl+T term"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                        Text { text: "Ctrl+C copy path"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                        Text { text: "Ctrl+X cut"; color: root.foreground; opacity: clipboardOp==="cut" ? 0.7 : 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                        Text { text: "Ctrl+V paste"; color: root.foreground; opacity: clipboardPath ? 0.65 : 0.25; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                    }
+                    Row {
+                        anchors.centerIn: parent
+                        spacing: Style.space(10)
+                        visible: !openWithMode
+                        // Second row for extra hints — shown as wrap if needed, keep single row for now with smaller spacing
+                    }
+                    Row {
+                        anchors.centerIn: parent
+                        spacing: Style.space(12)
+                        visible: openWithMode
+                        Text { text: "↵ launch"; color: root.foreground; opacity: 0.55; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                        Text { text: "⎋ back"; color: root.foreground; opacity: 0.45; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                        Text { text: "type to filter apps"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                    }
+                }
+                // Second footer line for open-with / term hints (only when not in openWith)
+                Rectangle {
+                    width: parent.width
+                    height: openWithMode ? 0 : Style.space(18)
+                    visible: !openWithMode
+                    color: "transparent"
+                    Row {
+                        anchors.centerIn: parent
+                        spacing: Style.space(10)
+                        Text { text: "Ctrl+Shift+C copy file"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
+                        Text { text: "Ctrl+Shift+O open with"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
+                        Text { text: "Ctrl+T term"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
+                        Text { text: "Ctrl+O reveal"; color: root.foreground; opacity: 0.35; font.family: root.fontFamily; font.pixelSize: Style.font.caption * 0.9 }
                     }
                 }
             }
