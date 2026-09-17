@@ -1065,7 +1065,9 @@ Item {
         Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
     }
     function rebuildAppDisplay() {
-        console.log("Omafinder: rebuildAppDisplay openWithMode=" + openWithMode + " mime=" + openWithMime + " allIds=" + openWithAllIds.length + " rec=" + openWithRecommendedIds.length + " q=" + filterText + " lib=" + (appLibrary ? "ok" : (shell && shell.appLibrary ? "shellLib" : "null")))
+        var _dbgShell = shell ? "shell:" + typeof shell : "no-shell"
+        var _dbgLib = appLibrary ? "ok" : (shell && shell.appLibrary ? "shellLib:" + typeof shell.appLibrary : "null")
+        console.log("Omafinder: rebuildAppDisplay openWithMode=" + openWithMode + " mime=" + openWithMime + " allIds=" + openWithAllIds.length + " rec=" + openWithRecommendedIds.length + " q=" + filterText + " lib=" + _dbgLib + " shell=" + _dbgShell + " hasRec=" + (openWithMode && openWithMime !== "" && openWithRecommendedIds.length > 0))
         displayModel.clear()
         var lib = appLibrary || (shell && shell.appLibrary ? shell.appLibrary : null)
         // Build recommended set early for fallback path as well
@@ -1080,12 +1082,16 @@ Item {
                 recSetEarly[ridE] = true; recSetEarly[ridE.slice(0,-8)] = true
                 recSetEarly[String(openWithRecommendedIds[re]||"")] = true
             }
+            console.log("Omafinder: recSetEarly keys=" + Object.keys(recSetEarly).slice(0,10).join(",") + " hasRec=" + hasRecEarly)
+        } else {
+            console.log("Omafinder: hasRecEarly false - recLen=" + openWithRecommendedIds.length + " mime=" + openWithMime)
         }
         if (!lib) {
             // Fallback via DesktopEntries — but still respect Recommended filter
             try {
                 if (typeof DesktopEntries !== "undefined" && DesktopEntries.applications) {
                     var vals = DesktopEntries.applications.values || []
+                    console.log("Omafinder: fallback vals len=" + vals.length + " hasRecEarly=" + hasRecEarly)
                     if (vals.length > 0) {
                         var q2 = String(filterText||"").trim().toLowerCase()
                         var filtered = []
@@ -1605,12 +1611,29 @@ Item {
                                         if (!visible) return "";
                                         var name = String(row.appIcon||"");
                                         if (!name) return "";
+                                        if (name.indexOf("/") === 0 || name.indexOf("file://") === 0) return name.indexOf("file://")===0 ? name : Util.fileUrl(name);
                                         if (appLibrary) {
-                                            var s = appLibrary.iconSource(name);
-                                            if (s && String(s).length) return s;
+                                            try {
+                                                var s = appLibrary.iconSource(name);
+                                                if (s && String(s).length) return s;
+                                            } catch(e) {}
                                         }
-                                        // Fallback to Quickshell.iconPath when appLibrary unavailable or returns empty
                                         var qp = Quickshell.iconPath(name, true);
+                                        var generic = Quickshell.iconPath("application-x-executable", true);
+                                        var isGeneric = qp && String(qp).length && String(qp) === String(generic) && name !== "application-x-executable";
+                                        if (qp && String(qp).length && !isGeneric) return qp;
+                                        // Try direct hicolor/scalable paths as file:// fallback
+                                        var candidates = [
+                                            "/usr/share/icons/hicolor/48x48/apps/" + name + ".png",
+                                            "/usr/share/icons/hicolor/256x256/apps/" + name + ".png",
+                                            "/usr/share/icons/hicolor/128x128/apps/" + name + ".png",
+                                            "/usr/share/icons/hicolor/scalable/apps/" + name + ".svg",
+                                            "/usr/share/pixmaps/" + name + ".png",
+                                            "/usr/share/pixmaps/" + name + ".svg"
+                                        ];
+                                        for (var ci=0; ci<candidates.length; ci++) {
+                                            if (ci===0) return Util.fileUrl(candidates[ci]);
+                                        }
                                         if (qp && String(qp).length) return qp;
                                         return "";
                                     }
@@ -1619,7 +1642,11 @@ Item {
                                     sourceSize.height: height * Screen.devicePixelRatio
                                     asynchronous: true
                                     anchors.verticalCenter: parent.verticalCenter
-                                    onStatusChanged: if (status === Image.Error) visible = false
+                                    onStatusChanged: {
+                                        if (status === Image.Error) {
+                                            visible = false
+                                        }
+                                    }
                                 }
                                 Image {
                                     id: fileIconImage
