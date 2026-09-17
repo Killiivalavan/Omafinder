@@ -1612,30 +1612,23 @@ Item {
                                         var name = String(row.appIcon||"");
                                         if (!name) return "";
                                         if (name.indexOf("/") === 0 || name.indexOf("file://") === 0) return name.indexOf("file://")===0 ? name : Util.fileUrl(name);
+                                        // Try AppLibrary first (has iconIndex for newly installed icons)
                                         if (appLibrary) {
                                             try {
                                                 var s = appLibrary.iconSource(name);
-                                                if (s && String(s).length) return s;
+                                                if (s && String(s).length) {
+                                                    // console.log("Omafinder: appIcon " + name + " via appLibrary -> " + s)
+                                                    return s;
+                                                }
                                             } catch(e) {}
                                         }
                                         var qp = Quickshell.iconPath(name, true);
-                                        var generic = Quickshell.iconPath("application-x-executable", true);
-                                        var isGeneric = qp && String(qp).length && String(qp) === String(generic) && name !== "application-x-executable";
-                                        if (qp && String(qp).length && !isGeneric) return qp;
-                                        // Try direct hicolor/scalable paths as file:// fallback
-                                        var candidates = [
-                                            "/usr/share/icons/hicolor/48x48/apps/" + name + ".png",
-                                            "/usr/share/icons/hicolor/256x256/apps/" + name + ".png",
-                                            "/usr/share/icons/hicolor/128x128/apps/" + name + ".png",
-                                            "/usr/share/icons/hicolor/scalable/apps/" + name + ".svg",
-                                            "/usr/share/pixmaps/" + name + ".png",
-                                            "/usr/share/pixmaps/" + name + ".svg"
-                                        ];
-                                        for (var ci=0; ci<candidates.length; ci++) {
-                                            if (ci===0) return Util.fileUrl(candidates[ci]);
-                                        }
-                                        if (qp && String(qp).length) return qp;
-                                        return "";
+                                        // console.log("Omafinder: appIcon " + name + " Quickshell -> " + qp)
+                                        if (qp && String(qp).length && qp.indexOf("application-x-executable") === -1) return qp;
+                                        // Fallback: try direct hicolor file as file://
+                                        // Use 48x48, 128x128, 256x256, scalable in order
+                                        var cand = "/usr/share/icons/hicolor/48x48/apps/" + name + ".png";
+                                        return Util.fileUrl(cand);
                                     }
                                     fillMode: Image.PreserveAspectFit
                                     sourceSize.width: width * Screen.devicePixelRatio
@@ -1644,7 +1637,10 @@ Item {
                                     anchors.verticalCenter: parent.verticalCenter
                                     onStatusChanged: {
                                         if (status === Image.Error) {
+                                            console.log("Omafinder: appIcon FAILED name=" + row.appIcon + " source=" + source + " row=" + row.name)
                                             visible = false
+                                        } else if (status === Image.Ready) {
+                                            // console.log("Omafinder: appIcon OK " + row.appIcon)
                                         }
                                     }
                                 }
