@@ -38,6 +38,13 @@ omarchy plugin add https://github.com/Killiivalavan/Omafinder.git --enable
 
 After installation, launch Omafinder from the Omarchy launcher or your configured keybinding.
 
+To remove Omafinder from your plugins:
+
+```bash
+omarchy plugin remove killie.omafinder
+```
+or, can be removed through the omarchy launcher.
+
 ## Usage
 
 Omafinder is designed around a simple flow:
