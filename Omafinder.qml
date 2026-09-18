@@ -19,7 +19,7 @@ Item {
     property string filterText: ""
     property int selectedIndex: 0
     property bool cursorActive: false
-    property bool showHidden: true
+    property bool showHidden: false
     property var dirEntries: [] // {name, path, isDir, hidden}
     property string pendingSearchQuery: ""
     property bool isSearching: false
@@ -152,7 +152,7 @@ Item {
             root.opened = false
             root.isAnimatingOut = false
             if (root.shell && typeof root.shell.hide === "function")
-                root.shell.hide(root.manifest ? root.manifest.id : "omafinder")
+                root.shell.hide(root.manifest ? root.manifest.id : "killie.omafinder")
         }
     }
 
@@ -1996,7 +1996,7 @@ Item {
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+V  — Paste into current folder"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+Shift+C  — Copy absolute path"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+D  — Trash (confirm)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
-                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Del  — Trash immediate"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Del  — Trash (opens the same confirm as Ctrl+D)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+N  — New folder"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "F2  — Rename (Enter confirm, Esc cancel, conflict errors in dialog)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+T  — Terminal here (folder → that folder, file → its dir)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
@@ -2035,7 +2035,7 @@ Item {
                                                 Column {
                                                     width: parent.width
                                                     spacing: 3
-                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Trash confirm:  ←/→/Tab switch, Enter confirm, Esc cancel, click scrim cancel"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Trash confirm:  ←/→/Tab switch, Enter confirm, Esc cancel, click scrim cancel — Del and Ctrl+D both open it"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Help:  Esc / Enter / F1 / Ctrl+/ close, click scrim close"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                 }
                                             }

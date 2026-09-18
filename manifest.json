@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "id": "omafinder",
+  "id": "killie.omafinder",
   "name": "Omafinder",
   "version": "0.1.0",
-  "author": "local",
-  "description": "Transient, keyboard-first filesystem navigator — summon, locate, act, disappear",
+  "author": "Killiivalavan",
+  "description": "A transient keyboard-first file navigator for quickly finding and managing files in Omarchy",
   "kinds": ["overlay"],
   "keepLoaded": true,
   "entryPoints": {
