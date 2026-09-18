@@ -171,7 +171,7 @@ Omafinder uses standard Linux desktop tools where appropriate, including:
 * `xdg-terminal-exec` and common terminal emulators for terminal integration
 * Omarchy's application library for desktop application integration where available
 
-The exact tools available on your system may affect which fallback is used.
+These are optional system utilities; Omafinder uses available alternatives where possible.
 
 ## Permissions & Safety
 
@@ -193,8 +193,7 @@ Filesystem operations are performed through standard desktop and filesystem util
 
 Omafinder is intentionally not a replacement for a full file manager.
 
-It focuses on **quick access and common actions** rather than persistent file management.
-
+It focuses on **quick access and common actions** rather than providing a full persistent file-manager interface.
 There is no:
 
 * Two-pane interface
