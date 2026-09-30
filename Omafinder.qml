@@ -751,8 +751,8 @@ Item {
 
         // Use stat to determine real type, because fuzzy globalPaths isDir heuristic may be stale.
         pendingActivatePath = path
-        // Use test -d via bash
-        var cmd = "if [ -d " + Util.shellQuote(path) + " ]; then echo DIR; elif [ -e " + Util.shellQuote(path) + " ]; then echo FILE; else echo MISSING; fi"
+        // Use test -d via bash (-L so a dangling symlink reports FILE, not MISSING)
+        var cmd = "if [ -d " + Util.shellQuote(path) + " ]; then echo DIR; elif [ -e " + Util.shellQuote(path) + " ] || [ -L " + Util.shellQuote(path) + " ]; then echo FILE; else echo MISSING; fi"
         statProc.command = ["bash","-lc", cmd]
         statProc.running = true
     }
@@ -829,7 +829,7 @@ Item {
                 // Try expanded as file in currentDir
                 var tryFile = joinPath(currentDir, q)
                 pendingActivatePath = tryFile
-                statDirectProc.command = ["bash","-lc", "if [ -e " + Util.shellQuote(expanded) + " ] || [ -d " + Util.shellQuote(expanded) + " ]; then if [ -d " + Util.shellQuote(expanded) + " ]; then echo DIR; else echo FILE; fi; else echo MISSING; fi"]
+                statDirectProc.command = ["bash","-lc", "if [ -e " + Util.shellQuote(expanded) + " ] || [ -L " + Util.shellQuote(expanded) + " ] || [ -d " + Util.shellQuote(expanded) + " ]; then if [ -d " + Util.shellQuote(expanded) + " ]; then echo DIR; else echo FILE; fi; else echo MISSING; fi"]
                 statDirectProc.running = true
                 // store q for fallback
                 pendingDirectFilter = q
@@ -838,8 +838,8 @@ Item {
         }
         // Path-like: test expanded
         pendingActivatePath = expanded
-        // Reuse statProc for direct path
-        var cmd = "if [ -d " + Util.shellQuote(expanded) + " ]; then echo DIR; elif [ -e " + Util.shellQuote(expanded) + " ]; then echo FILE; else echo MISSING; fi"
+        // Reuse statProc for direct path (-L so dangling symlink is FILE, not MISSING)
+        var cmd = "if [ -d " + Util.shellQuote(expanded) + " ]; then echo DIR; elif [ -e " + Util.shellQuote(expanded) + " ] || [ -L " + Util.shellQuote(expanded) + " ]; then echo FILE; else echo MISSING; fi"
         statDirectProc.command = ["bash","-lc", cmd]
         statDirectProc.running = true
         pendingDirectFilter = q
@@ -911,7 +911,7 @@ Item {
         if (!src) {
             // Fallback: read uri-list from the system clipboard via wl-paste/xclip,
             // then copy into the current dir — src never enters the JS layer.
-            pasteProc.command = ["bash","-lc", "src=$(wl-paste --type text/uri-list 2>/dev/null | tr -d '\\r' | head -n1 | sed 's/^file:\\/\\///;s/%20/ /g' | tr -d '\\n'); if [ -z \"$src\" ]; then src=$(xclip -selection clipboard -o -t text/uri-list 2>/dev/null | head -n1 | sed 's/^file:\\/\\///' | tr -d '\\n'); fi; if [ -z \"$src\" ]; then echo NOCLIP; exit 0; fi; src=$(printf %s \"$src\" | sed 's/%0D//g' | head -n1); if [ ! -e \"$src\" ]; then echo NOTFOUND:$src; exit 0; fi; dest=" + Util.shellQuote(currentDir) + "/$(basename -- \"$src\"); if [ -e \"$dest\" ]; then echo EXISTS:$dest; exit 0; fi; gio copy \"$src\" \"$dest\" 2>/dev/null || cp -a -- \"$src\" \"$dest\" 2>/dev/null; if [ $? -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"]
+            pasteProc.command = ["bash","-lc", "src=$(wl-paste --type text/uri-list 2>/dev/null | tr -d '\\r' | head -n1 | sed 's/^file:\\/\\///;s/%20/ /g' | tr -d '\\n'); if [ -z \"$src\" ]; then src=$(xclip -selection clipboard -o -t text/uri-list 2>/dev/null | head -n1 | sed 's/^file:\\/\\///' | tr -d '\\n'); fi; if [ -z \"$src\" ]; then echo NOCLIP; exit 0; fi; src=$(printf %s \"$src\" | sed 's/%0D//g' | head -n1); if [ ! -e \"$src\" ] && [ ! -L \"$src\" ]; then echo NOTFOUND:$src; exit 0; fi; dest=" + Util.shellQuote(currentDir) + "/$(basename -- \"$src\"); if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then echo EXISTS:$dest; exit 0; fi; gio copy \"$src\" \"$dest\" 2>/dev/null || cp -an -- \"$src\" \"$dest\" 2>/dev/null; if [ $? -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"]
             pasteProc.running = true
             return
         }
@@ -923,9 +923,9 @@ Item {
         // Avoid overwriting — find unused name
         var cmd
         if (op === "cut") {
-            cmd = "src=" + Util.shellQuote(src) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio move -- \"$src\" \"$dest\" 2>/dev/null || mv -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo MOVED:$dest; else echo FAIL; fi"
+            cmd = "src=" + Util.shellQuote(src) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ] || [ -L \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio move -- \"$src\" \"$dest\" 2>/dev/null || mv -n -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo MOVED:$dest; else echo FAIL; fi"
         } else {
-            cmd = "src=" + Util.shellQuote(src) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio copy -- \"$src\" \"$dest\" 2>/dev/null || cp -a -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"
+            cmd = "src=" + Util.shellQuote(src) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ] || [ -L \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio copy -- \"$src\" \"$dest\" 2>/dev/null || cp -an -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"
         }
         pasteProc.command = ["bash","-lc", cmd]
         pasteProc.running = true
@@ -1076,12 +1076,17 @@ Item {
         if (!checkPath) checkPath = newPath
         renameError = ""
         // Async existence + move via renameProc
+        // NOTE: -L check matters — [ -e ] is false for a dangling symlink,
+        // so without it we would miss an existing destination and overwrite it.
         var cmd = "old=" + Util.shellQuote(t.path) + "; new=" + Util.shellQuote(newPath) + "; check=" + Util.shellQuote(checkPath) + "; "
-        cmd += "if [ -e \"$check\" ]; then echo EXISTS; exit 0; fi; "
-        // Try gio move first, fallback to mv
-        cmd += "gio move -- \"$old\" \"$new\" 2>/dev/null && echo MOVED:$new && exit 0; "
-        cmd += "mv -- \"$old\" \"$new\" 2>/dev/null && echo MOVED:$new && exit 0; "
-        cmd += "echo FAIL"
+        cmd += "if [ -e \"$check\" ] || [ -L \"$check\" ]; then echo EXISTS; exit 0; fi; "
+        // Try gio move first, fallback to mv -n (no-clobber).
+        // Verify the source actually went away and the dest exists, so a
+        // TOCTOU race or a no-clobber skip is reported as EXISTS, never as silent overwrite.
+        cmd += "gio move -- \"$old\" \"$new\" 2>/dev/null; if [ ! -e \"$old\" ] && [ ! -L \"$old\" ] && { [ -e \"$new\" ] || [ -L \"$new\" ]; }; then echo MOVED:$new; exit 0; fi; "
+        cmd += "if [ -e \"$check\" ] || [ -L \"$check\" ]; then echo EXISTS; exit 0; fi; "
+        cmd += "mv -n -- \"$old\" \"$new\" 2>/dev/null; if [ ! -e \"$old\" ] && [ ! -L \"$old\" ] && { [ -e \"$new\" ] || [ -L \"$new\" ]; }; then echo MOVED:$new; exit 0; fi; "
+        cmd += "if [ -e \"$check\" ] || [ -L \"$check\" ]; then echo EXISTS; else echo FAIL; fi"
         renameProc.command = ["bash","-lc", cmd]
         renameProc.running = true
     }
@@ -1089,7 +1094,7 @@ Item {
     function createFolder() {
         var base = currentDir
         var name = "New Folder"
-        var cmd = "base=" + Util.shellQuote(base) + "; name=" + Util.shellQuote(name) + "; i=1; target=\"$base/$name\"; while [ -e \"$target\" ]; do target=\"$base/$name $i\"; i=$((i+1)); done; mkdir -p \"$target\" && echo \"$target\""
+        var cmd = "base=" + Util.shellQuote(base) + "; name=" + Util.shellQuote(name) + "; i=1; target=\"$base/$name\"; while [ -e \"$target\" ] || [ -L \"$target\" ]; do target=\"$base/$name $i\"; i=$((i+1)); done; mkdir -p \"$target\" && echo \"$target\""
         createFolderProc.command = ["bash","-lc", cmd]
         createFolderProc.running = true
     }
