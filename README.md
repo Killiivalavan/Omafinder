@@ -4,6 +4,10 @@ A keyboard-first file navigator for quickly finding and managing files in Omarch
 
 Omafinder is a transient filesystem navigator built for Omarchy. Summon it, find what you need, perform an action, and get out of the way.
 
+![Omafinder browsing the home directory](preview.png)
+
+![Omafinder fuzzy searching across the home directory](preview-search.png)
+
 ## Features
 
 * **Fuzzy file search** across your home directory
@@ -20,6 +24,7 @@ Omafinder is a transient filesystem navigator built for Omarchy. Summon it, find
   * Paste
   * Rename
   * New folder
+  * New file
   * Trash
   * Copy absolute path
   * Reveal in file manager
@@ -36,7 +41,31 @@ Install Omafinder through the Omarchy plugin system:
 omarchy plugin add https://github.com/Killiivalavan/Omafinder.git --enable
 ```
 
-After installation, launch Omafinder from the Omarchy launcher or your configured keybinding.
+After installation, Omafinder is enabled but has no global shortcut by default.
+
+## Opening Omafinder
+
+Open it any time from a terminal (no keybinding needed):
+
+```bash
+omarchy-shell shell toggle killie.omafinder
+```
+
+### Optional keybinding (suggested: Super+E)
+
+To open Omafinder with one key, add this line to `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + E", "Omafinder", "omarchy-shell shell toggle killie.omafinder")
+```
+
+Then reload Hyprland configuration:
+
+```bash
+omarchy restart hyprctl
+```
+
+Pick any free key combination you prefer. This step is optional and only adds a shortcut; the terminal command above always works.
 
 To remove Omafinder from your plugins:
 
@@ -87,6 +116,7 @@ Press `Enter` to open the selected file or enter the selected directory.
 | `Ctrl+D` / `Delete`     | Trash                                       |
 | `F2`                    | Rename                                      |
 | `Ctrl+N`                | New folder                                  |
+| `Ctrl+Shift+N`          | New file                                    |
 | `Ctrl+T`                | Open terminal here                          |
 | `Ctrl+O`                | Reveal in file manager                      |
 | `Ctrl+Shift+O`          | Open With                                   |
@@ -150,7 +180,7 @@ Name conflicts are handled by generating a new name rather than overwriting the 
 
 `F2` renames the selected item.
 
-`Ctrl+N` creates a new folder. If the default name already exists, Omafinder generates an available alternative.
+`Ctrl+N` opens a prompt to create a folder and `Ctrl+Shift+N` opens a prompt to create a file in the current directory. Type a name and press `Enter` (`Esc` cancels). If the name already exists, Omafinder shows an error and lets you pick another name instead of overwriting.
 
 ### Trash
 

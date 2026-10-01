@@ -47,6 +47,12 @@ Item {
     property string renameText: ""
     property string renameError: ""
     property int renameSelected: 1
+    // Create (new file / new folder prompt)
+    property bool createOpen: false
+    property string createMode: "" // "file" or "folder"
+    property string createText: ""
+    property string createError: ""
+    property int createSelected: 1
     // For Open With mime filtering
     property string openWithMime: ""
     property var openWithRecommendedIds: []
@@ -114,6 +120,9 @@ Item {
         renameOpen = false
         renameTarget = null
         renameError = ""
+        createOpen = false
+        createMode = ""
+        createError = ""
         if (searchProc.running) searchProc.running = false
         searchDebounce.stop()
         isSearching = false
@@ -122,6 +131,10 @@ Item {
     function dismiss() {
         if (renameOpen) {
             cancelRename()
+            return
+        }
+        if (createOpen) {
+            cancelCreate()
             return
         }
         if (helpOpen) {
@@ -1032,7 +1045,7 @@ Item {
     function closeHelp() { helpOpen = false; Qt.callLater(function(){ keyCatcher.forceActiveFocus() }) }
     function toggleHelp() { if (helpOpen) closeHelp(); else openHelp() }
     function requestRename() {
-        if (renameOpen || helpOpen || trashConfirmOpen || openWithMode) return
+        if (renameOpen || createOpen || helpOpen || trashConfirmOpen || openWithMode) return
         if (!cursorActive || displayModel.count===0) return
         var row = displayModel.get(selectedIndex)
         if (!row || !row.path) return
@@ -1091,22 +1104,73 @@ Item {
         renameProc.running = true
     }
 
-    function createFolder() {
-        var base = currentDir
-        var name = "New Folder"
-        var cmd = "base=" + Util.shellQuote(base) + "; name=" + Util.shellQuote(name) + "; i=1; target=\"$base/$name\"; while [ -e \"$target\" ] || [ -L \"$target\" ]; do target=\"$base/$name $i\"; i=$((i+1)); done; mkdir -p \"$target\" && echo \"$target\""
-        createFolderProc.command = ["bash","-lc", cmd]
-        createFolderProc.running = true
+    function requestCreate(mode) {
+        if (renameOpen || createOpen || helpOpen || trashConfirmOpen || openWithMode) return
+        createMode = (mode === "file") ? "file" : "folder"
+        createText = ""
+        createError = ""
+        createSelected = 1
+        createOpen = true
+        Qt.callLater(function(){ if (createInput) { createInput.forceActiveFocus() } })
+    }
+    function cancelCreate() {
+        createOpen = false
+        createMode = ""
+        createError = ""
+        createSelected = 1
+        Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
+    }
+    function confirmCreate() {
+        if (!createOpen) return
+        var name = String(createText||"").trim()
+        if (!name) { createError = "Name cannot be empty"; return }
+        if (name.indexOf("/")!==-1) { createError = "Name cannot contain '/'"; return }
+        var target = joinPath(normalizeDir(currentDir), name)
+        createError = ""
+        // Single shell invocation: refuse anything already there (incl. dangling
+        // symlinks, which [ -e ] alone misses), then create atomically.
+        // mkdir without -p and noclobber redirect both fail on symlinks,
+        // so even a race cannot silently replace a user-owned link.
+        var cmd = "target=" + Util.shellQuote(target) + "; "
+        cmd += "if [ -e \"$target\" ] || [ -L \"$target\" ]; then echo EXISTS; exit 0; fi; "
+        if (createMode === "folder") {
+            cmd += "mkdir -- \"$target\" 2>/dev/null && echo CREATED:\"$target\" && exit 0; "
+        } else {
+            cmd += "set -o noclobber; : > \"$target\" 2>/dev/null && echo CREATED:\"$target\" && exit 0; "
+        }
+        cmd += "if [ -e \"$target\" ] || [ -L \"$target\" ]; then echo EXISTS; else echo FAIL; fi"
+        createProc.command = ["bash","-lc", cmd]
+        createProc.running = true
     }
     Process {
-        id: createFolderProc
-        stdout: StdioCollector { waitForEnd: true; onStreamFinished: {
-            var created = String(text||"").trim()
-            if (created) {
-                bumpFrecency(created + "/")
-                refreshDir()
+        id: createProc
+        stdout: StdioCollector { id: createOutput; waitForEnd: true }
+        onExited: function(code){
+            var out = String(createOutput.text||"").trim()
+            if (out === "EXISTS") {
+                createError = "An item with that name already exists"
+                Qt.callLater(function(){ if (createInput) { createInput.forceActiveFocus(); createInput.selectAll() } })
+                return
             }
-        } }
+            if (out.indexOf("CREATED:")===0) {
+                var created = out.slice(8)
+                var wasFolder = createMode === "folder"
+                createOpen = false
+                createMode = ""
+                createError = ""
+                createSelected = 1
+                if (created) {
+                    bumpFrecency(wasFolder ? created + "/" : created)
+                    saveState()
+                    refreshDir()
+                    // Select the new entry once the list rebuilds
+                    pendingRenameSelect = created
+                }
+                Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
+                return
+            }
+            createError = "Create failed"
+        }
     }
 
     Process {
@@ -1492,7 +1556,7 @@ Item {
             Item {
                 id: keyCatcher
                 anchors.fill: parent
-                z: (root.trashConfirmOpen || root.helpOpen || root.renameOpen) ? 20 : 0
+                z: (root.trashConfirmOpen || root.helpOpen || root.renameOpen || root.createOpen) ? 20 : 0
                 focus: true
                 Keys.priority: Keys.BeforeItem
                 Keys.onPressed: function(event){
@@ -1502,6 +1566,16 @@ Item {
                             cancelRename(); event.accepted = true; return
                         } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                             confirmRename(); event.accepted = true; return
+                        }
+                        // Let the TextInput handle everything else (editing, selection)
+                        return
+                    }
+                    // Create dialog shares top priority with rename
+                    if (createOpen) {
+                        if (event.key === Qt.Key_Escape) {
+                            cancelCreate(); event.accepted = true; return
+                        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            confirmCreate(); event.accepted = true; return
                         }
                         // Let the TextInput handle everything else (editing, selection)
                         return
@@ -1650,8 +1724,11 @@ Item {
                             root.revealInFileManager(r3.path)
                         }
                         event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_N) {
+                        root.requestCreate("file")
+                        event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_N) {
-                        root.createFolder()
+                        root.requestCreate("folder")
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_D) {
                         // Trash with confirm (Ctrl+D) — recoverable
@@ -1898,6 +1975,170 @@ Item {
                     }
                 }
 
+                // Create overlay — scrim + card with inline input and error (mirrors rename)
+                Item {
+                    id: createOverlay
+                    anchors.fill: parent
+                    visible: createOpen
+                    z: 32
+
+                    Rectangle {
+                        anchors.fill: parent
+                        color: Util.alpha(Color.menu.background, 0.65)
+                        MouseArea { anchors.fill: parent; onClicked: cancelCreate() }
+
+                        BorderSurface {
+                            id: createCard
+                            width: Math.min(parent.width - Style.space(32), Style.space(460))
+                            height: createCard.contentTopInset + createCard.contentBottomInset + Style.space(18) + Style.space(10) + Style.space(40) + (createError !== "" ? Style.space(20) : 0) + Style.space(10) + Style.space(34)
+                            anchors.centerIn: parent
+                            color: root.background
+                            borderSpec: Border.flat(root.selectedText, Style.normalBorderWidth)
+                            padding: Style.space(18)
+                            radius: root.cornerRadius
+
+                            MouseArea { anchors.fill: parent; onClicked: { if (createInput) createInput.forceActiveFocus() } }
+
+                            Item {
+                                anchors.fill: parent
+                                anchors.topMargin: createCard.contentTopInset
+                                anchors.rightMargin: createCard.contentRightInset
+                                anchors.bottomMargin: createCard.contentBottomInset
+                                anchors.leftMargin: createCard.contentLeftInset
+
+                                Text {
+                                    id: createTitle
+                                    textFormat: Text.PlainText
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.top: parent.top
+                                    text: createMode === "file" ? "New file" : "New folder"
+                                    color: root.foreground
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.title
+                                }
+
+                                Rectangle {
+                                    id: createField
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.top: createTitle.bottom
+                                    anchors.topMargin: Style.space(10)
+                                    height: Style.space(40)
+                                    radius: root.cornerRadius
+                                    color: Qt.rgba(1,1,1,0.04)
+                                    border.width: createInput.activeFocus ? 1 : 0
+                                    border.color: Util.alpha(root.selectedText, 0.6)
+
+                                    Text {
+                                        textFormat: Text.PlainText
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        anchors.leftMargin: Style.space(12)
+                                        anchors.rightMargin: Style.space(12)
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: createMode === "file" ? "File name…" : "Folder name…"
+                                        visible: createText === ""
+                                        color: root.foreground
+                                        opacity: 0.38
+                                        font.family: root.fontFamily
+                                        font.pixelSize: Style.font.body
+                                        elide: Text.ElideRight
+                                    }
+
+                                    TextInput {
+                                        id: createInput
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        anchors.leftMargin: Style.space(12)
+                                        anchors.rightMargin: Style.space(12)
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        height: implicitHeight
+                                        text: createText
+                                        color: root.foreground
+                                        font.family: root.fontFamily
+                                        font.pixelSize: Style.font.body
+                                        clip: true
+                                        selectByMouse: true
+                                        onTextEdited: root.createText = text
+                                        Keys.priority: Keys.BeforeItem
+                                        Keys.onPressed: function(event) {
+                                            if (event.key === Qt.Key_Escape) {
+                                                cancelCreate()
+                                                event.accepted = true
+                                            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                                                confirmCreate()
+                                                event.accepted = true
+                                            }
+                                        }
+                                        Component.onCompleted: {
+                                            if (createOpen) { forceActiveFocus() }
+                                        }
+                                    }
+                                }
+
+                                Text {
+                                    id: createErrorText
+                                    textFormat: Text.PlainText
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.top: createField.bottom
+                                    anchors.topMargin: Style.space(6)
+                                    text: createError
+                                    visible: createError !== ""
+                                    color: Color.urgent
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    elide: Text.ElideRight
+                                }
+
+                                Row {
+                                    anchors.right: parent.right
+                                    anchors.bottom: parent.bottom
+                                    spacing: Style.space(10)
+
+                                    Repeater {
+                                        model: ["Cancel", "Create"]
+
+                                        BorderSurface {
+                                            required property int index
+                                            required property string modelData
+
+                                            readonly property bool selected: createSelected === index
+
+                                            width: Style.space(88)
+                                            height: Style.space(34)
+                                            color: selected ? root.selectedBackground : "transparent"
+                                            borderSpec: Border.flat(selected ? root.selectedText : Util.alpha(root.foreground, 0.38), Style.normalBorderWidth)
+                                            radius: 0
+
+                                            Text {
+                                                textFormat: Text.PlainText
+                                                anchors.centerIn: parent
+                                                text: modelData
+                                                color: selected ? root.selectedText : root.foreground
+                                                font.family: root.fontFamily
+                                                font.pixelSize: Style.font.caption
+                                            }
+
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                hoverEnabled: true
+                                                cursorShape: Qt.PointingHandCursor
+                                                onEntered: createSelected = index
+                                                onClicked: {
+                                                    if (index === 0) cancelCreate()
+                                                    else confirmCreate()
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Help overlay — scrim + card with scrollable keybinding reference
                 Item {
                     id: helpOverlay
@@ -2002,7 +2243,8 @@ Item {
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+Shift+C  — Copy absolute path"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+D  — Trash (confirm)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Del  — Trash (opens the same confirm as Ctrl+D)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
-                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+N  — New folder"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+N  — New folder… (type a name, Enter confirms)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+Shift+N  — New file… (type a name, Enter confirms)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "F2  — Rename (Enter confirm, Esc cancel, conflict errors in dialog)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+T  — Terminal here (folder → that folder, file → its dir)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+O  — Reveal in file manager"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
@@ -2084,7 +2326,7 @@ Item {
                     Text {
                         textFormat: Text.PlainText
                         width: parent.width
-                        text: openWithMode ? ("Open with: " + Fuzzy.basename(openWithFile)) : (tildeCollapse(currentDir) + (showHidden ? "" : "  • hidden hidden") + (isSearching ? "  • searching…" : "") + (clipboardPath ? "  • " + clipboardOp + ": " + Fuzzy.basename(clipboardPath) : ""))
+                        text: openWithMode ? ("Open with: " + Fuzzy.basename(openWithFile)) : (tildeCollapse(currentDir) + (showHidden ? "" : "  • hidden") + (isSearching ? "  • searching…" : "") + (clipboardPath ? "  • " + clipboardOp + ": " + Fuzzy.basename(clipboardPath) : ""))
                         color: root.foreground
                         opacity: 0.55
                         font.family: root.fontFamily
