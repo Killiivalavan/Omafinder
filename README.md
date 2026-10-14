@@ -15,6 +15,10 @@ Omafinder is a transient filesystem navigator built for Omarchy. Summon it, find
 * **Direct path navigation** with paths such as `~/Documents`, `./foo`, and `../bar`
 * **Frecency-based ranking** for paths you use frequently or recently
 * **Hidden file support**
+* **Preview pane** with file thumbnails, text snippets, and file metadata
+* **List and tile views** with a remembered toggle
+* **Multi-select** with range support for batch actions
+* **Drive switcher** for USB sticks and fixed data partitions (mounts on demand, no automount)
 * **File operations** without leaving the keyboard:
 
   * Open
@@ -97,30 +101,78 @@ Press `Enter` to open the selected file or enter the selected directory.
 
 ## Keybindings
 
-| Key                     | Action                                      |
-| ----------------------- | ------------------------------------------- |
-| `↑` / `↓`               | Move selection                              |
-| `Page Up` / `Page Down` | Move by 6 results                           |
-| `Home` / `End`          | First / last result                         |
-| `Enter`                 | Open file or enter directory                |
-| `Backspace`             | Go to parent directory when search is empty |
-| `Alt+Backspace`         | Go to parent directory                      |
-| `←`                     | Go to parent directory when search is empty |
-| `Esc`                   | Dismiss                                     |
-| `Ctrl+H` / `Ctrl+.`     | Toggle hidden files                         |
-| `Ctrl+Shift+H`          | Go to home directory                        |
-| `Ctrl+C`                | Copy                                        |
-| `Ctrl+X`                | Cut                                         |
-| `Ctrl+V`                | Paste                                       |
-| `Ctrl+Shift+C`          | Copy absolute path                          |
-| `Ctrl+D` / `Delete`     | Trash                                       |
-| `F2`                    | Rename                                      |
-| `Ctrl+N`                | New folder                                  |
-| `Ctrl+Shift+N`          | New file                                    |
-| `Ctrl+T`                | Open terminal here                          |
-| `Ctrl+O`                | Reveal in file manager                      |
-| `Ctrl+Shift+O`          | Open With                                   |
-| `F1` / `Ctrl+/`         | Show help                                   |
+| Key                         | Action                                  |
+| --------------------------- | --------------------------------------- |
+| `↑` / `↓`                   | Move selection (a row in tiles)         |
+| `←` / `→`                   | Parent folder / move in tiles           |
+| `Page Up` / `Page Down`     | Move by 6 results (a page in tiles)     |
+| `Home` / `End`              | First / last result                     |
+| `Enter`                     | Open file, folder, or checked set       |
+| `Backspace`                 | Parent folder when search is empty      |
+| `Alt+Backspace`             | Parent folder                           |
+| `Esc`                       | Clear selection, then dismiss           |
+| `Ctrl+H` / `Ctrl+.`         | Toggle hidden files                     |
+| `Ctrl+Shift+H`              | Go to home directory                    |
+| `Ctrl+Shift+P`              | Toggle preview pane                     |
+| `Ctrl+Shift+V`              | Toggle list / tile view                 |
+| `Ctrl+B`                    | Drives overlay                          |
+| `Ctrl+C`                    | Copy (checked set or current)           |
+| `Ctrl+X`                    | Cut (checked set or current)            |
+| `Ctrl+V`                    | Paste                                   |
+| `Ctrl+Shift+C`              | Copy absolute path (all checked)        |
+| `Ctrl+D` / `Delete`         | Trash (one confirm for a set)           |
+| `F2`                        | Rename                                  |
+| `Ctrl+N`                    | New folder                              |
+| `Ctrl+Shift+N`              | New file                                |
+| `Ctrl+T`                    | Open terminal here                      |
+| `Ctrl+O`                    | Reveal in file manager                  |
+| `Ctrl+Shift+O`              | Open With                               |
+| `Ctrl+Click` / `Ctrl+Space` | Toggle file in multi-select set         |
+| `Shift+Click` / arrows      | Select range from anchor                |
+| `Ctrl+arrows`               | Move cursor keeping selection           |
+| `Ctrl+A`                    | Select all visible                      |
+| `F1` / `Ctrl+/`             | Show help                               |
+
+### Multi-select
+
+Actions apply to the whole checked set: `Enter` opens all files (asks above
+10; a lone selected folder is entered too), `Ctrl+C`/`Ctrl+X` copy/cut every
+checked file, `Ctrl+D` trashes with a single confirm. `Esc` clears the set.
+Typing a new filter drops anything no longer visible.
+
+## Drives
+
+`Ctrl+B` opens a transient drive switcher over the panel. It lists Home, the
+system root, and detected drives (USB sticks, fixed data partitions such as a
+Windows SSD) from `lsblk`. Nothing is automounted: choosing an unmounted
+drive mounts it on demand and navigates there; the overlay then closes.
+
+Mounting is delegated to udisks2, the same system service the file manager
+uses. If the system policy requires authentication, the system polkit agent
+prompts for it. Omafinder never requests, receives, or stores credentials and
+contains no privilege escalation code. Encrypted volumes are never prompted
+inside Omafinder; they hand off to the file manager for unlocking.
+
+The list refreshes live while the overlay is open: plugging or unplugging a
+drive adds or removes its row without reopening. Browsing a removed drive
+falls back to the home directory.
+
+## Preview
+
+`Ctrl+Shift+P` toggles a preview pane that follows the selected item. Images
+render whole-image; videos and PDFs show first-page thumbnails; text files
+show a snippet; folders show an item count. Every preview carries file
+metadata: size, modified time, type, dimensions or duration, and permissions.
+
+The pane choice is remembered. Thumbnails are cached under
+`~/.cache/omafinder/` and only the selected item ever loads, so browsing stays
+instant.
+
+## Views
+
+`Ctrl+Shift+V` switches between a detail list and a four-column tile grid of
+large icons. Both views share the same search, selection, actions, and preview
+pane; only the layout and arrow-key movement change. The choice is remembered.
 
 ## Search
 
@@ -160,7 +212,7 @@ State is stored at:
 ~/.local/state/omarchy/omafinder/state.json
 ```
 
-The stored state includes navigation state, frecency data, and the hidden-file preference.
+The stored state includes navigation state, frecency data, and the hidden-file, preview-pane, and list/tile-view preferences.
 
 ## File Operations
 
@@ -168,7 +220,7 @@ Omafinder handles common filesystem actions directly from the overlay.
 
 ### Copy and cut
 
-`Ctrl+C` and `Ctrl+X` place the selected file or directory into Omafinder's clipboard state and the system clipboard.
+`Ctrl+C` and `Ctrl+X` place the selected files or directories into Omafinder's clipboard state and the system clipboard. With a checked multi-select set, every checked item is staged; otherwise the current row is used.
 
 ### Paste
 
@@ -184,7 +236,7 @@ Name conflicts are handled by generating a new name rather than overwriting the 
 
 ### Trash
 
-`Ctrl+D` or `Delete` moves an item to the desktop trash using the system's trash mechanism.
+`Ctrl+D` or `Delete` moves items to the desktop trash using the system's trash mechanism. A checked set is trashed with a single confirm.
 
 Omafinder does **not** fall back to permanently deleting files with `rm`.
 
@@ -204,6 +256,8 @@ Omafinder uses standard Linux desktop tools where appropriate, including:
 
 * `fd` for fast filesystem searching, with `find` as a fallback
 * `gio` for desktop file operations
+* `lsblk` and `udisksctl` for drive listing and on-demand mounting (same service the file manager uses)
+* `ffmpegthumbnailer`, `poppler` (`pdftoppm`/`pdfinfo`), ImageMagick (`identify`) and `ffmpeg` (`ffprobe`) for previews and metadata — all stock on Omarchy, with graceful fallbacks where possible
 * `wl-paste` or `xclip` for clipboard integration
 * `xdg-terminal-exec` and common terminal emulators for terminal integration
 * Omarchy's application library for desktop application integration where available
@@ -234,9 +288,7 @@ It focuses on **quick access and common actions** rather than providing a full p
 There is no:
 
 * Two-pane interface
-* File preview system
 * Content indexing
-* Mount manager
 * Background filesystem daemon
 * Full file-manager navigation interface
 

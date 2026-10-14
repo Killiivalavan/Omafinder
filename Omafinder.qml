@@ -2,6 +2,7 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 import QtQuick
+import QtQuick.Effects
 import qs.Commons
 import qs.Ui
 import "Fuzzy.js" as Fuzzy
@@ -20,9 +21,63 @@ Item {
     property int selectedIndex: 0
     property bool cursorActive: false
     property bool showHidden: false
+    property bool showPreview: true
+    property int previewWidth: Style.space(340)
+    property bool previewVisible: showPreview
+    // Tile view: layout switch only (no thumbnails — the preview pane owns
+    // visuals). Same model, search, actions; only renderer + arrow math differ.
+    property string viewMode: "list"
+    readonly property bool effectiveGrid: viewMode === "grid" && !openWithMode
+    property int gridColumns: 4
+    property int cellHeight: Math.max(Style.space(100), Style.font.body + Style.space(64))
+    property int gridCellWidth: Math.max(1, Math.floor(listContainer.width / gridColumns))
+    property string previewPath: ""
+    property string previewKind: ""
+    property string previewUrl: ""
+    property string previewText: ""
+    property bool previewLoading: false
+    property string previewName: ""
+    property string previewIconName: "dialog-information"
+    property string previewAppIcon: ""
+    property string previewAppId: ""
+    property string previewAppDetail: ""
+    property string previewMetaPath: ""
+    property string previewMetaSize: ""
+    property string previewMetaModified: ""
+    property string previewMetaType: ""
+    property string previewMetaExtra: ""
+    property string previewMetaPerms: ""
+    property string previewRequest: ""
+    property string previewRequestKind: ""
+    property string previewMetaRequest: ""
+    property string previewCacheDir: home + "/.cache/omafinder/previews"
+    // Drive switcher (transient overlay; no automount, no privilege code —
+    // mounting is delegated to udisks2, auth stays with the system polkit agent)
+    property bool drivesOpen: false
+    property int drivesSelected: 0
+    property bool drivesLoading: false
+    property bool drivesMounting: false
+    property string drivesMountRequest: ""
+    // Live-update bookkeeping (popup-only; nothing runs while closed)
+    property bool drivesQuietRefresh: false
+    property bool drivesRefreshPending: false
+    property bool drivesSuppressRefresh: false
     property var dirEntries: [] // {name, path, isDir, hidden}
     property string pendingSearchQuery: ""
     property bool isSearching: false
+    // Multi-select: path-keyed set (immutable replaces so bindings refresh)
+    // plus a range anchor. Pruned to visible rows on every rebuild.
+    property var selectedPaths: ({})
+    property int selectedCount: 0
+    property int anchorIndex: -1
+    // Multi-file clipboard/paste queue, multi-trash, multi-open confirm
+    property var clipboardPaths: []
+    property var pendingPaste: []
+    property var multiTrashPaths: []
+    property bool multiConfirmOpen: false
+    property string multiConfirmMessage: ""
+    property var pendingMultiOpen: []
+    property string pendingMultiDir: ""
     property var frecency: ({})
     property string statePath: home + "/.local/state/omarchy/omafinder/state.json"
     property string stateDir: home + "/.local/state/omarchy/omafinder"
@@ -73,13 +128,15 @@ Item {
     property int contentMargin: Style.spacing.panelPadding
     property int headerHeight: Math.max(Style.space(42), Style.font.title + Style.spacing.controlPaddingY * 2 + 6)
     property int contentSpacing: Style.spacing.md
-    property int cardWidth: Math.min(Style.space(620), panel.width - Style.gapsOut * 2)
+    property int cardWidth: previewVisible ? Math.min(Style.space(960), panel.width - Style.gapsOut * 2) : Math.min(Style.space(620), panel.width - Style.gapsOut * 2)
     property int rowHeight: Math.max(Style.space(46), Style.font.body + Style.font.caption + 10)
     property int rowSpacing: Style.spacing.xs
     property int visibleRows: 9
+    // Shared row budget for the card AND the list/preview row: floors at 4 so
+    // sparse folders keep a usable preview instead of overflowing a tiny card.
+    property int contentRows: Math.max(4, Math.min(displayModel.count, visibleRows))
     property int cardHeight: {
-        var rows = Math.min(displayModel.count, visibleRows)
-        if (rows === 0) rows = 1
+        var rows = root.contentRows
         var listH = rows * rowHeight + Math.max(0, rows - 1) * rowSpacing
         var total = contentMargin*2 + headerHeight + contentSpacing + listH
         // Single persistent footer — 28 + spacing for breathing room so footer not clipped
@@ -102,20 +159,43 @@ Item {
         isSearching = false
         openWithMode = false
         openWithFile = ""
+        // Never paint another session's ghost: a deleted file's preview must
+        // not survive into a fresh open (stale image, stale metadata).
+        previewPath = ""
+        previewKind = ""
+        previewUrl = ""
+        previewText = ""
+        previewLoading = false
+        previewName = ""
+        previewMetaPath = ""
+        previewMetaSize = ""
+        previewMetaModified = ""
+        previewMetaType = ""
+        previewMetaExtra = ""
+        previewMetaPerms = ""
         if (searchProc.running) searchProc.running = false
         searchDebounce.stop()
         root.rebuildDisplay()
         refreshDir()
+        root.schedulePreview()
         Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
     }
 
     function close() {
+        if (previewProc.running) previewProc.running = false
+        if (metaProc.running) metaProc.running = false
+        previewDebounce.stop()
         root.opened = false
         root.isAnimatingOut = false
         openWithMode = false
         openWithFile = ""
         trashConfirmOpen = false
         trashTarget = null
+        multiConfirmOpen = false
+        pendingMultiOpen = []
+        pendingMultiDir = ""
+        multiConfirmMessage = ""
+        clearSelection()
         helpOpen = false
         renameOpen = false
         renameTarget = null
@@ -143,6 +223,18 @@ Item {
         }
         if (trashConfirmOpen) {
             cancelTrashConfirm()
+            return
+        }
+        if (multiConfirmOpen) {
+            multiConfirmOpen = false
+            pendingMultiOpen = []
+            pendingMultiDir = ""
+            multiConfirmMessage = ""
+            return
+        }
+        // Multi-select: first Esc clears the set instead of dismissing
+        if (selectedCount > 0) {
+            clearSelection()
             return
         }
         if (root.isAnimatingOut) return
@@ -184,9 +276,25 @@ Item {
                 var cd = String(data.currentDir)
                 if (cd) currentDir = cd
             }
-            if (data.frecency && typeof data.frecency === "object") frecency = data.frecency
+            if (data.frecency && typeof data.frecency === "object") {
+                // Sanitize keys: state is user-writable, and __proto__-style
+                // keys would otherwise mutate the accumulator's prototype.
+                var clean = {}
+                for (var fk in data.frecency) {
+                    if (fk === "__proto__" || fk === "constructor" || fk === "prototype") continue
+                    if (!Object.prototype.hasOwnProperty.call(data.frecency, fk)) continue
+                    clean[fk] = data.frecency[fk]
+                }
+                frecency = clean
+            }
             if (typeof data.showHidden === "boolean") {
                 showHidden = data.showHidden
+            }
+            if (typeof data.showPreview === "boolean") {
+                showPreview = data.showPreview
+            }
+            if (data.viewMode === "grid" || data.viewMode === "list") {
+                viewMode = data.viewMode
             }
             stateLoaded = true
         } catch(e) { stateLoaded = true }
@@ -195,7 +303,9 @@ Item {
         var payload = {
             currentDir: currentDir,
             frecency: frecency,
-            showHidden: showHidden
+            showHidden: showHidden,
+            showPreview: showPreview,
+            viewMode: viewMode
         }
         // Atomic write via FileView (temp file + rename) — a crash mid-write
         // can no longer leave a truncated state.json behind.
@@ -217,7 +327,7 @@ Item {
         onLoaded: root.loadState(text())
         onLoadFailed: root.stateLoaded = true
     }
-    Component.onCompleted: stateDirProc.running = true
+    Component.onCompleted: { stateDirProc.running = true; previewCacheProc.running = true }
 
     // ---- Path helpers ----
     function tildeCollapse(path) {
@@ -341,8 +451,10 @@ Item {
         var dir = normalizeDir(currentDir)
         currentDir = dir
         var lsFlag = showHidden ? "-A" : ""
-        // Use ls -1 -p --group-directories-first ; fallback if not supported
-        var cmd = "ls -1 -p --group-directories-first " + lsFlag + " -- " + Util.shellQuote(dir) + " 2>/dev/null || ls -1 -p " + lsFlag + " -- " + Util.shellQuote(dir) + " 2>/dev/null"
+        // Use ls -1 -p --group-directories-first ; fallback if not supported.
+        // A trailing marker distinguishes "gone" (fell back home) from "empty".
+        // Output capped: model only keeps ~100 rows, no need to haul more.
+        var cmd = "{ ls -1 -p --group-directories-first " + lsFlag + " -- " + Util.shellQuote(dir) + " 2>/dev/null || ls -1 -p " + lsFlag + " -- " + Util.shellQuote(dir) + " 2>/dev/null || echo __OMAFINDER_GONE__; } | head -n 2000"
         listProc.command = ["bash","-lc", cmd]
         listProc.running = true
     }
@@ -353,6 +465,17 @@ Item {
         stderr: StdioCollector { waitForEnd: true }
         onExited: function(code){
             var raw = String(listOutput.text||"")
+            // Listing failed: the directory is gone (unplugged drive). Fall
+            // back home for removable trees only — never for $HOME or /.
+            if (raw.indexOf("__OMAFINDER_GONE__") !== -1) {
+                raw = raw.split("\n").filter(function(l){ return l.trim() !== "__OMAFINDER_GONE__" }).join("\n")
+                var gone = String(currentDir || "")
+                if ((gone.indexOf("/media/") === 0 || gone.indexOf("/run/media/") === 0) && normalizeDir(gone) !== normalizeDir(home)) {
+                    dirEntries = []
+                    navigateToDir(home)
+                    return
+                }
+            }
             var lines = raw.split("\n")
             var entries = []
             for (var i=0;i<lines.length;i++){
@@ -376,7 +499,7 @@ Item {
                         selectedIndex = rs
                         cursorActive = true
                         layoutSerial++
-                        Qt.callLater(function(){ resultList.positionViewAtIndex(selectedIndex, ListView.Contain) })
+                        Qt.callLater(function(){ root.ensureVisibleAt(selectedIndex) })
                         return
                     }
                 }
@@ -453,7 +576,7 @@ Item {
                     selectedIndex = 0; cursorActive = true
                 }
                 layoutSerial++
-                if (displayModel.count>0) Qt.callLater(function(){ resultList.positionViewAtIndex(selectedIndex, ListView.Contain) })
+                if (displayModel.count>0) Qt.callLater(function(){ root.ensureVisibleAt(selectedIndex) })
                 return
             }
             var lines = raw.split("\n")
@@ -513,7 +636,7 @@ Item {
             layoutSerial++
             if (displayModel.count===0) { selectedIndex=0; cursorActive=false }
             else { selectedIndex=0; cursorActive=true }
-            Qt.callLater(function(){ if (displayModel.count>0) resultList.positionViewAtIndex(selectedIndex, ListView.Contain) })
+            Qt.callLater(function(){ if (displayModel.count>0) root.ensureVisibleAt(selectedIndex) })
         }
     }
 
@@ -588,7 +711,7 @@ Item {
             }
             layoutSerial += 1
             if (displayModel.count>0) { selectedIndex = Math.min(selectedIndex, displayModel.count-1); cursorActive=true } else { selectedIndex=0; cursorActive=false }
-            Qt.callLater(function(){ if (displayModel.count>0) resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain) })
+            Qt.callLater(function(){ if (displayModel.count>0) root.ensureVisibleAt(root.selectedIndex) })
             return
         }
 
@@ -662,7 +785,7 @@ Item {
         else if (selectedIndex<0) { selectedIndex=0; cursorActive=true }
         else if (!cursorActive && displayModel.count>0) { cursorActive=true }
 
-        Qt.callLater(function(){ if (displayModel.count>0) resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain) })
+        Qt.callLater(function(){ if (displayModel.count>0) root.ensureVisibleAt(root.selectedIndex) })
     }
 
     function isPathLikeForSearch(q) {
@@ -672,20 +795,214 @@ Item {
     property int layoutSerial: 0
 
     // ---- Selection / activation ----
-    function select(delta) {
+    function ensureVisibleAt(idx) {
+        if (root.effectiveGrid) gridView.positionViewAtIndex(idx, GridView.Contain)
+        else resultList.positionViewAtIndex(idx, ListView.Contain)
+    }
+
+    function toggleView() {
+        viewMode = viewMode === "grid" ? "list" : "grid"
+        saveState()
+        root.disarmPointer()
+        Qt.callLater(function(){ root.ensureVisibleAt(root.selectedIndex) })
+    }
+
+    function select(delta, keep) {
         if (displayModel.count===0) return
         root.disarmPointer()
         if (!cursorActive) { cursorActive=true; selectedIndex = delta<0 ? displayModel.count-1 : 0 }
         else selectedIndex = (selectedIndex + delta + displayModel.count) % displayModel.count
-        resultList.positionViewAtIndex(selectedIndex, ListView.Contain)
+        if (keep !== true) clearSelection()
+        anchorIndex = selectedIndex
+        root.ensureVisibleAt(selectedIndex)
     }
 
-    function selectAbsolute(idx) {
+    function selectAbsolute(idx, keep) {
         if (displayModel.count===0) return
         root.disarmPointer()
         cursorActive=true
         selectedIndex = Math.max(0, Math.min(idx, displayModel.count-1))
-        resultList.positionViewAtIndex(selectedIndex, ListView.Contain)
+        if (keep !== true) clearSelection()
+        anchorIndex = selectedIndex
+        root.ensureVisibleAt(selectedIndex)
+    }
+
+    // Grid vertical motion: clamp at edges (no wrap), like a file manager.
+    function selectGridRow(delta, keep) {
+        if (displayModel.count===0) return
+        root.disarmPointer()
+        if (!cursorActive) {
+            cursorActive = true
+            selectedIndex = delta < 0 ? displayModel.count - 1 : 0
+        } else {
+            selectedIndex = Math.max(0, Math.min(displayModel.count - 1, selectedIndex + delta * gridColumns))
+        }
+        if (keep !== true) clearSelection()
+        anchorIndex = selectedIndex
+        root.ensureVisibleAt(selectedIndex)
+    }
+
+    function selectGridPage(delta, keep) {
+        if (displayModel.count===0) return
+        root.disarmPointer()
+        if (!cursorActive) {
+            cursorActive = true
+            selectedIndex = delta < 0 ? displayModel.count - 1 : 0
+        } else {
+            var rows = Math.max(1, Math.floor(gridView.height / cellHeight))
+            selectedIndex = Math.max(0, Math.min(displayModel.count - 1, selectedIndex + delta * gridColumns * rows))
+        }
+        if (keep !== true) clearSelection()
+        anchorIndex = selectedIndex
+        root.ensureVisibleAt(selectedIndex)
+    }
+
+    // ---- Multi-select primitives ----
+    function isSelected(path) {
+        return !!selectedPaths[String(path || "")]
+    }
+    function setSelectedPaths(next) {
+        selectedPaths = next
+        selectedCount = Object.keys(next).length
+    }
+    function clearSelection() {
+        if (selectedCount === 0 && anchorIndex === -1) return
+        selectedPaths = {}
+        selectedCount = 0
+        anchorIndex = -1
+    }
+    function rowPathAt(idx) {
+        if (idx < 0 || idx >= displayModel.count) return ""
+        try {
+            var r = displayModel.get(idx)
+            return String((r && r.path) || "")
+        } catch(e) { return "" }
+    }
+    // Drop anything no longer visible; resets the range anchor.
+    function pruneSelection() {
+        if (selectedCount === 0) { anchorIndex = -1; return }
+        var kept = {}
+        for (var i = 0; i < displayModel.count; i++) {
+            var p = rowPathAt(i)
+            if (p && selectedPaths[p]) kept[p] = true
+        }
+        setSelectedPaths(kept)
+        anchorIndex = -1
+    }
+    // Ordered {path,isDir} targets: the set when non-empty, else the cursor.
+    function actionTargets() {
+        var out = []
+        if (selectedCount > 0) {
+            for (var i = 0; i < displayModel.count; i++) {
+                var r = null
+                try { r = displayModel.get(i) } catch(e) { r = null }
+                if (!r) continue
+                var p = String(r.path || "")
+                if (p && isSelected(p)) out.push({ path: p, isDir: !!r.isDir })
+            }
+        } else if (cursorActive && displayModel.count > 0) {
+            var c = null
+            try { c = displayModel.get(selectedIndex) } catch(e) { c = null }
+            if (c && String(c.path || "")) out.push({ path: String(c.path), isDir: !!c.isDir })
+        }
+        return out
+    }
+    function applyRange(a, b, union) {
+        var lo = Math.max(0, Math.min(a, b))
+        var hi = Math.min(displayModel.count - 1, Math.max(a, b))
+        var next = union ? JSON.parse(JSON.stringify(selectedPaths)) : {}
+        for (var i = lo; i <= hi; i++) {
+            var p = rowPathAt(i)
+            if (p) next[p] = true
+        }
+        setSelectedPaths(next)
+    }
+    function toggleSelect(idx) {
+        var p = rowPathAt(idx)
+        if (!p) return
+        var next = JSON.parse(JSON.stringify(selectedPaths))
+        if (next[p]) delete next[p]
+        else next[p] = true
+        setSelectedPaths(next)
+        cursorActive = true
+        selectedIndex = Math.max(0, Math.min(idx, displayModel.count - 1))
+        anchorIndex = selectedIndex
+        root.disarmPointer()
+        root.ensureVisibleAt(selectedIndex)
+    }
+    function rangeSelectTo(idx, union) {
+        if (displayModel.count === 0) return
+        var t = Math.max(0, Math.min(idx, displayModel.count - 1))
+        if (anchorIndex < 0) anchorIndex = selectedIndex
+        applyRange(anchorIndex, t, union === true)
+        cursorActive = true
+        selectedIndex = t
+        root.disarmPointer()
+        root.ensureVisibleAt(selectedIndex)
+    }
+    function shiftSelect(delta, union) {
+        if (displayModel.count === 0) return
+        root.disarmPointer()
+        if (!cursorActive) {
+            cursorActive = true
+            selectedIndex = delta < 0 ? displayModel.count - 1 : 0
+            anchorIndex = selectedIndex
+            root.ensureVisibleAt(selectedIndex)
+            return
+        }
+        if (anchorIndex < 0) anchorIndex = selectedIndex
+        var n = (selectedIndex + delta + displayModel.count) % displayModel.count
+        applyRange(anchorIndex, n, union === true)
+        selectedIndex = n
+        root.ensureVisibleAt(selectedIndex)
+    }
+    function shiftGridRow(delta, union) {
+        if (displayModel.count === 0) return
+        root.disarmPointer()
+        if (!cursorActive) {
+            cursorActive = true
+            selectedIndex = delta < 0 ? displayModel.count - 1 : 0
+            anchorIndex = selectedIndex
+            root.ensureVisibleAt(selectedIndex)
+            return
+        }
+        if (anchorIndex < 0) anchorIndex = selectedIndex
+        var n = Math.max(0, Math.min(displayModel.count - 1, selectedIndex + delta * gridColumns))
+        applyRange(anchorIndex, n, union === true)
+        selectedIndex = n
+        root.ensureVisibleAt(selectedIndex)
+    }
+    // Grid horizontal motion never wraps: at a row edge the cursor holds
+    // still instead of teleporting across the whole list (the old wrap made
+    // Left/Right feel randomly broken in tiles).
+    function selectGridLinear(delta, keep) {
+        if (displayModel.count === 0) return
+        root.disarmPointer()
+        if (!cursorActive) {
+            cursorActive = true
+            selectedIndex = delta < 0 ? displayModel.count - 1 : 0
+        } else {
+            selectedIndex = Math.max(0, Math.min(displayModel.count - 1, selectedIndex + delta))
+        }
+        if (keep !== true) clearSelection()
+        anchorIndex = selectedIndex
+        root.ensureVisibleAt(selectedIndex)
+    }
+    function shiftGridLinear(delta, union) {
+        if (displayModel.count === 0) return
+        root.disarmPointer()
+        if (!cursorActive) {
+            cursorActive = true
+            selectedIndex = delta < 0 ? displayModel.count - 1 : 0
+            anchorIndex = selectedIndex
+            root.ensureVisibleAt(selectedIndex)
+            return
+        }
+        if (anchorIndex < 0) anchorIndex = selectedIndex
+        var n = Math.max(0, Math.min(displayModel.count - 1, selectedIndex + delta))
+        applyRange(anchorIndex, n, union === true)
+        selectedIndex = n
+        root.ensureVisibleAt(selectedIndex)
     }
 
     function setFilter(next) {
@@ -731,6 +1048,7 @@ Item {
         if (parent === currentDir) return false
         currentDir = parent
         saveState()
+        clearSelection()
         // bump parent frecency?
         refreshDir()
         // clear filter? Keep filter but rebuild
@@ -743,6 +1061,7 @@ Item {
         currentDir = d
         bumpFrecency(d + "/")
         saveState()
+        clearSelection()
         filterText = ""
         selectedIndex = 0
         refreshDir()
@@ -755,6 +1074,7 @@ Item {
 
     function activateIndex(index) {
         if (index<0 || index>=displayModel.count) return
+        clearSelection()
         var row = displayModel.get(index)
         var path = String(row.path||"")
         if (!path) return
@@ -817,10 +1137,51 @@ Item {
         root.dismiss()
     }
 
+    // Enter on a non-empty set: open all files (one dismiss), navigate into
+    // the directory when the set holds exactly one. >10 files asks first.
+    function activateSelection() {
+        var targets = actionTargets()
+        if (!targets.length) return
+        var files = []
+        var dirs = []
+        for (var i = 0; i < targets.length; i++) {
+            if (targets[i].isDir) dirs.push(targets[i].path)
+            else files.push(targets[i].path)
+        }
+        if (files.length > 10) {
+            pendingMultiOpen = files
+            pendingMultiDir = dirs.length === 1 ? dirs[0] : ""
+            var shown = files.slice(0, 3).map(function(f){ return Fuzzy.basename(f) }).join(", ")
+            multiConfirmMessage = "Open " + files.length + " files?\n" + shown + (files.length > 3 ? ", …" : "")
+            multiConfirmOpen = true
+            return
+        }
+        doMultiOpen(files, dirs.length === 1 ? dirs[0] : "")
+    }
+    function doMultiOpen(files, dir) {
+        for (var i = 0; i < files.length; i++) {
+            bumpFrecency(files[i])
+        }
+        saveState()
+        for (var j = 0; j < files.length; j++) {
+            Util.execDetached("xdg-open " + Util.shellQuote(files[j]) + " >/dev/null 2>&1 &")
+        }
+        clearSelection()
+        if (dir) {
+            if (openWithMode) exitOpenWithMode()
+            navigateToDir(dir)
+        } else {
+            root.dismiss()
+        }
+    }
+
     function handleEnterOnFilter() {
         var q = String(filterText||"").trim()
         if (!q) {
-            if (displayModel.count>0 && cursorActive) activateIndex(selectedIndex)
+            if (displayModel.count>0 && cursorActive) {
+                if (selectedCount > 0) activateSelection()
+                else activateIndex(selectedIndex)
+            }
             return
         }
         // If filter is a direct path that exists, act on it directly (even if not in list)
@@ -892,22 +1253,45 @@ Item {
     function copyPath(path) {
         var p = String(path||"")
         if (!p) return
-        var cmd = "printf %s " + Util.shellQuote(p) + " | (command -v wl-copy >/dev/null 2>&1 && wl-copy || xclip -selection clipboard 2>/dev/null || true)"
+        var cmd = "printf %s " + Util.shellQuote(String(p).replace(/[\n\r]/g, "")) + " | (command -v wl-copy >/dev/null 2>&1 && wl-copy || xclip -selection clipboard 2>/dev/null || true)"
         Util.execDetached(cmd)
         bumpFrecency(p)
         root.dismiss()
     }
+    function copyPaths(paths) {
+        var list = []
+        for (var i = 0; i < (paths || []).length; i++) {
+            var pp = String(paths[i] || "")
+            if (pp) list.push(pp)
+        }
+        if (!list.length) return
+        // Newlines are legal in filenames but would split the exported
+        // uri-list/plaintext into phantom entries — strip for export only.
+        var args = list.map(function(p){ return Util.shellQuote(String(p).replace(/[\n\r]/g, "")) }).join(" ")
+        Util.execDetached("printf '%s\\n' " + args + " | (command -v wl-copy >/dev/null 2>&1 && wl-copy || xclip -selection clipboard 2>/dev/null || true)")
+        for (var j = 0; j < list.length; j++) bumpFrecency(list[j])
+        clearSelection()
+        root.dismiss()
+    }
+    function copyFilesToClipboard(paths, op) {
+        var list = []
+        for (var i = 0; i < (paths || []).length; i++) {
+            var pp = String(paths[i] || "")
+            if (pp) list.push(pp)
+        }
+        if (!list.length) return
+        clipboardPaths = list.slice()
+        clipboardPath = list[0]
+        clipboardOp = op || "copy"
+        // Put file uris on the system clipboard for interoperability (nautilus, etc.)
+        var args = list.map(function(p){ return Util.shellQuote(String("file://" + p).replace(/[\n\r]/g, "")) }).join(" ")
+        Util.execDetached("printf '%s\\n' " + args + " | (command -v wl-copy >/dev/null 2>&1 && wl-copy --type text/uri-list || xclip -selection clipboard -t text/uri-list 2>/dev/null || true)")
+        for (var j = 0; j < list.length; j++) bumpFrecency(list[j])
+    }
     function copyFileToClipboard(path, op) {
         var p = String(path||"")
         if (!p) return
-        clipboardPath = p
-        clipboardOp = op || "copy"
-        // Put file uri on system clipboard for interoperability (nautilus, etc.)
-        var uri = "file://" + p
-        // Ensure absolute and handle dir trailing slash for uri
-        Util.execDetached("printf %s " + Util.shellQuote(uri) + " | wl-copy --type text/uri-list 2>/dev/null || printf %s " + Util.shellQuote(uri) + " | xclip -selection clipboard -t text/uri-list 2>/dev/null || true")
-        // Also copy plain path as fallback
-        bumpFrecency(p)
+        copyFilesToClipboard([p], op)
     }
     function copyFile(path) {
         copyFileToClipboard(path, "copy")
@@ -919,6 +1303,13 @@ Item {
         navigateToDir(home)
     }
     function pasteClipboard() {
+        if (clipboardPaths.length > 0) {
+            // Multi (or single) queue: paste each entry sequentially here.
+            pendingPaste = clipboardPaths.map(function(p){ return { src: p, op: clipboardOp || "copy" } })
+            if (clipboardOp === "cut") { clipboardPaths = []; clipboardPath = ""; clipboardOp = "" }
+            pasteNext()
+            return
+        }
         var src = String(clipboardPath||"")
         var op = String(clipboardOp||"copy")
         if (!src) {
@@ -929,29 +1320,44 @@ Item {
             return
         }
         if (!src) return
+        pendingPaste = [{ src: src, op: op }]
+        if (op === "cut") { clipboardPath = ""; clipboardOp = "" }
+        pasteNext()
+    }
+    function pasteNext() {
+        if (!pendingPaste.length) return
+        var item = pendingPaste[0]
+        var psrc = String(item.src || "")
+        var pop = String(item.op || "copy")
+        if (!psrc) { pendingPaste.shift(); pasteNext(); return }
         var destBase = normalizeDir(currentDir)
-        var baseName = Fuzzy.basename(src)
+        var baseName = Fuzzy.basename(psrc)
         if (!baseName) baseName = "pasted"
         var dest = joinPath(destBase, baseName)
         // Avoid overwriting — find unused name
         var cmd
-        if (op === "cut") {
-            cmd = "src=" + Util.shellQuote(src) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ] || [ -L \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio move -- \"$src\" \"$dest\" 2>/dev/null || mv -n -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo MOVED:$dest; else echo FAIL; fi"
+        if (pop === "cut") {
+            cmd = "src=" + Util.shellQuote(psrc) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ] || [ -L \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio move -- \"$src\" \"$dest\" 2>/dev/null || mv -n -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo MOVED:$dest; else echo FAIL; fi"
         } else {
-            cmd = "src=" + Util.shellQuote(src) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ] || [ -L \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio copy -- \"$src\" \"$dest\" 2>/dev/null || cp -an -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"
+            cmd = "src=" + Util.shellQuote(psrc) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ] || [ -L \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio copy -- \"$src\" \"$dest\" 2>/dev/null || cp -an -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"
         }
         pasteProc.command = ["bash","-lc", cmd]
         pasteProc.running = true
-        // Clear cut after move
-        if (op === "cut") { clipboardPath = ""; clipboardOp = "" }
     }
     Process {
         id: pasteProc
         stdout: StdioCollector { id: pasteOutput; waitForEnd: true }
         onExited: function(code){
-            var out = String(pasteOutput.text||"").trim()
+            // StdioCollector accumulates across runs — read the last line so
+            // sequential queue pastes each report independently.
+            var rawLines = String(pasteOutput.text||"").split("\n")
+            var out = ""
+            for (var li = rawLines.length - 1; li >= 0; li--) {
+                if (String(rawLines[li]||"").trim() !== "") { out = String(rawLines[li]).trim(); break }
+            }
+            if (pendingPaste.length) pendingPaste.shift()
             if (out.indexOf("COPIED:")===0 || out.indexOf("MOVED:")===0) {
-                var created = out.split(":")[1]
+                var created = out.slice(out.indexOf(":") + 1)
                 if (created) bumpFrecency(created)
                 refreshDir()
                 // Stay open? Spec says disappear after, but for paste we might want to stay to show result
@@ -966,6 +1372,7 @@ Item {
             }
             // Dismiss after paste per spec
             // root.dismiss()
+            if (pendingPaste.length) pasteNext()
         }
     }
     function revealInFileManager(path) {
@@ -1003,19 +1410,42 @@ Item {
         Util.execDetached(cmd)
         root.dismiss()
     }
+    function trashItems(paths) {
+        var list = []
+        for (var i = 0; i < (paths || []).length; i++) {
+            var pp = String(paths[i] || "")
+            if (pp) list.push(pp)
+        }
+        if (!list.length) return
+        // No rm -rf fallback — the confirm dialog promises "Recoverable in Trash",
+        // so a missing trash tool must fail safe, not delete permanently.
+        for (var j = 0; j < list.length; j++) {
+            var cmd = "gio trash " + Util.shellQuote(list[j]) + " 2>/dev/null || trash-put " + Util.shellQuote(list[j]) + " 2>/dev/null"
+            Util.execDetached(cmd)
+        }
+        trashRefreshTimer.restart()
+        clearSelection()
+        root.dismiss()
+    }
     function trashItem(path) {
         var p = String(path||"")
         if (!p) return
-        // No rm -rf fallback — the confirm dialog promises "Recoverable in Trash",
-        // so a missing trash tool must fail safe, not delete permanently.
-        var cmd = "gio trash " + Util.shellQuote(p) + " 2>/dev/null || trash-put " + Util.shellQuote(p) + " 2>/dev/null"
-        Util.execDetached(cmd)
-        trashRefreshTimer.restart()
-        root.dismiss()
+        trashItems([p])
     }
     Timer { id: trashRefreshTimer; interval: 500; onTriggered: refreshDir() }
 
     function requestTrashWithConfirm(path) {
+        // A non-empty set trashes together with one confirm, not N dialogs.
+        if (selectedCount > 0) {
+            var targets = actionTargets().map(function(t){ return t.path })
+            if (targets.length) {
+                multiTrashPaths = targets
+                trashTarget = null
+                trashConfirm.selectedIndex = 1
+                trashConfirmOpen = true
+                return
+            }
+        }
         var p = String(path||"")
         if (!p) return
         // Avoid confirming for placeholder entries
@@ -1027,13 +1457,27 @@ Item {
         trashConfirm.selectedIndex = 1
         trashConfirmOpen = true
     }
+    function trashMultiMessage() {
+        var n = multiTrashPaths.length
+        var shown = multiTrashPaths.slice(0, 3).map(function(p){ return Fuzzy.basename(p) }).join(", ")
+        return "Move " + n + " items to Trash?\n" + shown + (n > 3 ? ", …" : "") + "\nRecoverable in Trash."
+    }
     function cancelTrashConfirm() {
         trashConfirmOpen = false
         trashTarget = null
+        multiTrashPaths = []
         trashConfirm.selectedIndex = 1
         Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
     }
     function confirmTrash() {
+        if (multiTrashPaths.length > 0) {
+            var ps = multiTrashPaths
+            multiTrashPaths = []
+            trashConfirmOpen = false
+            trashTarget = null
+            trashItems(ps)
+            return
+        }
         var t = trashTarget
         trashConfirmOpen = false
         trashTarget = null
@@ -1206,6 +1650,7 @@ Item {
     function enterOpenWithMode(path) {
         var p = String(path||"")
         if (!p) return
+        clearSelection()
         openWithFile = p
         openWithMode = true
         filterText = ""
@@ -1333,7 +1778,7 @@ Item {
                         iconName: ""
                     })
                 }
-                if (displayModel.count>0) { selectedIndex=0; cursorActive=true; layoutSerial++; Qt.callLater(function(){ resultList.positionViewAtIndex(0, ListView.Contain); }); return; }
+                if (displayModel.count>0) { selectedIndex=0; cursorActive=true; layoutSerial++; Qt.callLater(function(){ root.ensureVisibleAt(0); }); return; }
             }
             // Fallback to showing filtered via DesktopEntries if direct failed
             try {
@@ -1368,7 +1813,7 @@ Item {
                                 appId: String(fe.id||"")
                             , iconName: ""});
                         }
-                        if (displayModel.count>0) { selectedIndex=0; cursorActive=true; layoutSerial++; Qt.callLater(function(){ resultList.positionViewAtIndex(0, ListView.Contain); }); return; }
+                        if (displayModel.count>0) { selectedIndex=0; cursorActive=true; layoutSerial++; Qt.callLater(function(){ root.ensureVisibleAt(0); }); return; }
                     }
                 }
             } catch(e) {}
@@ -1461,7 +1906,7 @@ Item {
             selectedIndex=0; cursorActive=true
         }
         layoutSerial++
-        Qt.callLater(function(){ if (displayModel.count>0) resultList.positionViewAtIndex(selectedIndex, ListView.Contain) })
+        Qt.callLater(function(){ if (displayModel.count>0) root.ensureVisibleAt(selectedIndex) })
     }
     function launchAppWithFile(desktopId, filePath) {
         var did = String(desktopId||"").trim()
@@ -1485,7 +1930,7 @@ Item {
         cmd += "handlr launch --with=" + qDesktop + " " + qFile + " >/dev/null 2>&1; ec=$?; [ $ec -eq 0 ] && exit 0; "
         // Whole message is data — shellQuote keeps $(...) in a crafted filename from executing
         var failMsg = "Omafinder: launch failed for " + desktopFile + " with " + fp
-        cmd += "echo " + Util.shellQuote(failMsg) + " >> /tmp/omafinder_launch.log 2>&1; exit 1"
+        cmd += "echo " + Util.shellQuote(failMsg) + " >> " + Util.shellQuote(previewCacheDir + "/launch.log") + " 2>&1; exit 1"
         Util.execDetached(cmd)
         openWithMode = false
         openWithFile = ""
@@ -1498,6 +1943,646 @@ Item {
         refreshDir()
         if (openWithMode) rebuildAppDisplay()
         else rebuildDisplay()
+    }
+
+    function togglePreview() {
+        showPreview = !showPreview
+        saveState()
+        schedulePreview()
+    }
+
+    function previewKindForPath(path, isDir) {
+        if (isDir) return "folder"
+        var p = String(path || "").toLowerCase()
+        if (p.charAt(p.length - 1) === "/") p = p.slice(0, -1)
+        var dot = p.lastIndexOf(".")
+        var ext = dot !== -1 ? p.slice(dot + 1) : ""
+        if (ext === "jpg" || ext === "jpeg" || ext === "png" || ext === "gif" || ext === "bmp" || ext === "webp" || ext === "svg") return "image"
+        if (ext === "mp4" || ext === "mkv" || ext === "webm" || ext === "mov" || ext === "avi" || ext === "m4v") return "video"
+        if (ext === "pdf") return "pdf"
+        if (ext === "txt" || ext === "md" || ext === "json" || ext === "log" || ext === "cfg" || ext === "conf" || ext === "toml" || ext === "yaml" || ext === "yml" || ext === "xml" || ext === "csv" || ext === "sh" || ext === "js" || ext === "ts" || ext === "py" || ext === "rs" || ext === "go") return "text"
+        return "other"
+    }
+
+    function humanizeSize(bytes) {
+        var n = Number(bytes)
+        if (!isFinite(n) || n < 0) return ""
+        if (n < 1024) return n + " B"
+        var units = ["KB", "MB", "GB", "TB"]
+        var u = -1
+        var v = n
+        do { v = v / 1024; u++ } while (v >= 1024 && u < units.length - 1)
+        return (v >= 100 ? Math.round(v).toString() : v.toFixed(1)) + " " + units[u]
+    }
+
+    function formatMtime(epoch) {
+        var t = Number(epoch)
+        if (!isFinite(t) || t <= 0) return ""
+        var d = new Date(t * 1000)
+        try {
+            var y = d.getFullYear()
+            var m = ("0" + (d.getMonth() + 1)).slice(-2)
+            var day = ("0" + d.getDate()).slice(-2)
+            var h = ("0" + d.getHours()).slice(-2)
+            var mi = ("0" + d.getMinutes()).slice(-2)
+            return y + "-" + m + "-" + day + " " + h + ":" + mi
+        } catch(e) { return "" }
+    }
+
+    function clearPreview() {
+        previewPath = ""
+        previewKind = ""
+        previewUrl = ""
+        previewText = ""
+        previewLoading = false
+        previewName = ""
+        previewMetaPath = ""
+        previewMetaSize = ""
+        previewMetaModified = ""
+        previewMetaType = ""
+        previewMetaExtra = ""
+        previewMetaPerms = ""
+        previewRequest = ""
+        previewRequestKind = ""
+        previewMetaRequest = ""
+        if (previewProc.running) previewProc.running = false
+        if (metaProc.running) metaProc.running = false
+        previewDebounce.stop()
+    }
+
+    function showAppPreview() {
+        if (!cursorActive || displayModel.count === 0) { clearPreview(); return }
+        var row = null
+        try { row = displayModel.get(selectedIndex) } catch(e) { row = null }
+        if (!row || !row.path) { clearPreview(); return }
+        var apath = String(row.path || "")
+        previewPath = "__app__" + apath
+        previewKind = "app"
+        previewUrl = ""
+        previewText = ""
+        previewLoading = false
+        previewName = String(row.name || apath)
+        previewIconName = ""
+        previewAppIcon = String(row.appIcon || "")
+        previewAppId = String(row.appId || apath)
+        previewAppDetail = String(row.detail || "")
+        previewMetaPath = String(row.detail || apath)
+        previewMetaSize = ""
+        previewMetaModified = ""
+        previewMetaType = "Application"
+        previewMetaExtra = apath
+        previewMetaPerms = ""
+    }
+
+    function schedulePreview() {
+        if (!showPreview) { clearPreview(); return }
+        // Freeze while modal input is open — keep last preview visible
+        if (renameOpen || createOpen || helpOpen || trashConfirmOpen) return
+        // Don't chase search churn — keep last preview until results settle
+        if (isSearching) return
+        if (!root.opened) return
+        if (openWithMode) { showAppPreview(); return }
+        previewDebounce.restart()
+    }
+
+    function doPreview() {
+        if (!showPreview || !root.opened || openWithMode || isSearching) return
+        if (renameOpen || createOpen || helpOpen || trashConfirmOpen) return
+        if (!cursorActive || displayModel.count === 0) { clearPreview(); return }
+        var row = null
+        try { row = displayModel.get(selectedIndex) } catch(e) { row = null }
+        if (!row) { clearPreview(); return }
+        var path = String(row.path || "")
+        // Placeholder rows carry no path
+        if (!path) { clearPreview(); return }
+        if (path === previewPath && !previewLoading) return
+        var isDir = !!row.isDir
+        var kind = previewKindForPath(path, isDir)
+        previewPath = path
+        previewKind = kind
+        previewName = String(row.name || Fuzzy.basename(path))
+        previewIconName = String(row.iconName || (isDir ? "folder" : "text-x-generic"))
+        previewUrl = ""
+        previewText = ""
+        previewLoading = true
+        previewMetaPath = tildeCollapse(path)
+        previewMetaSize = ""
+        previewMetaModified = ""
+        previewMetaType = mimeForPath(path, isDir)
+        previewMetaExtra = ""
+        previewMetaPerms = ""
+        if (previewProc.running) previewProc.running = false
+        if (metaProc.running) metaProc.running = false
+        if (kind === "image") {
+            // Direct load — QML decodes async; sourceSize in the Image caps texture.
+            // A failure falls back to the icon via Image onStatusChanged.
+            previewUrl = Util.fileUrl(path)
+            previewLoading = false
+        } else if (kind === "text") {
+            previewRequest = path
+            previewRequestKind = "text"
+            previewProc.command = ["bash", "-lc", "timeout 8 head -c 4096 -- " + Util.shellQuote(path) + " 2>/dev/null || true"]
+            previewProc.running = true
+        } else if (kind === "video") {
+            previewRequest = path
+            previewRequestKind = "video"
+            var vcmd = "f=" + Util.shellQuote(path) + "; cache=" + Util.shellQuote(previewCacheDir) + "; "
+            vcmd += "mkdir -p \"$cache\"; "
+            vcmd += "sig=$(stat -c '%s:%Y' -- \"$f\" 2>/dev/null || echo '0:0'); "
+            vcmd += "h=$(printf '%s\\t%s' \"$f\" \"$sig\" | md5sum | cut -d ' ' -f1); "
+            vcmd += "t=\"$cache/$h.jpg\"; "
+            vcmd += "if [ ! -f \"$t\" ]; then timeout 8 ffmpegthumbnailer -i \"$f\" -o \"$t\" -s 512 -q 8 >/dev/null 2>&1 || rm -f \"$t\"; fi; "
+            vcmd += "if [ -f \"$t\" ]; then echo \"THUMB:$t\"; else echo NOTHUMB; fi"
+            previewProc.command = ["bash", "-lc", vcmd]
+            previewProc.running = true
+        } else if (kind === "pdf") {
+            previewRequest = path
+            previewRequestKind = "pdf"
+            var pcmd = "f=" + Util.shellQuote(path) + "; cache=" + Util.shellQuote(previewCacheDir) + "; "
+            pcmd += "mkdir -p \"$cache\"; "
+            pcmd += "sig=$(stat -c '%s:%Y' -- \"$f\" 2>/dev/null || echo '0:0'); "
+            pcmd += "h=$(printf '%s\\t%s' \"$f\" \"$sig\" | md5sum | cut -d ' ' -f1); "
+            pcmd += "base=\"$cache/$h\"; out=\"$base.jpg\"; "
+            pcmd += "if [ ! -f \"$out\" ]; then timeout 8 pdftoppm -jpeg -singlefile -r 100 -f 1 -l 1 -- \"$f\" \"$base\" >/dev/null 2>&1 || true; fi; "
+            pcmd += "if [ -f \"$out\" ]; then echo \"THUMB:$out\"; else echo NOTHUMB; fi"
+            previewProc.command = ["bash", "-lc", pcmd]
+            previewProc.running = true
+        } else if (kind === "folder") {
+            previewRequest = path
+            previewRequestKind = "folder"
+            previewProc.command = ["bash", "-lc", "ls -A -- " + Util.shellQuote(path) + " 2>/dev/null | wc -l | tr -d ' '"]
+            previewProc.running = true
+        } else {
+            previewLoading = false
+        }
+        // Meta for every kind (single stat + file + kind-specific extra)
+        previewMetaRequest = path
+        var mcmd = "f=" + Util.shellQuote(path) + "; "
+        mcmd += "size=$(stat -c '%s' -- \"$f\" 2>/dev/null || echo ''); "
+        mcmd += "mtime=$(stat -c '%Y' -- \"$f\" 2>/dev/null || echo ''); "
+        mcmd += "perms=$(stat -c '%A' -- \"$f\" 2>/dev/null || echo ''); "
+        mcmd += "mime=$(timeout 8 file -b --mime-type -- \"$f\" 2>/dev/null | tr -d '\\n' || echo ''); "
+        mcmd += "extra=''; "
+        mcmd += "case \"$f\" in "
+        mcmd += "*.jpg|*.JPG|*.jpeg|*.JPEG|*.png|*.PNG|*.gif|*.GIF|*.bmp|*.BMP|*.webp|*.WEBP|*.svg|*.SVG) "
+        mcmd += "dim=$(timeout 8 identify -format '%wx%h' -- \"$f\" 2>/dev/null || echo ''); [ -n \"$dim\" ] && extra=\"DIM:$dim\";; "
+        mcmd += "*.mp4|*.MP4|*.mkv|*.MKV|*.webm|*.WEBM|*.mov|*.MOV|*.avi|*.AVI|*.m4v|*.M4V) "
+        mcmd += "probe=$(timeout 8 ffprobe -v quiet -show_entries stream=width,height,duration -of default=nw=1:nk=1 -- \"$f\" 2>/dev/null | head -n 8 | tr '\\n' ' ' | cut -c1-80 || echo ''); [ -n \"$probe\" ] && extra=\"MEDIA:$probe\";; "
+        mcmd += "*.pdf|*.PDF) "
+        mcmd += "pages=$(timeout 8 pdfinfo -- \"$f\" 2>/dev/null | grep -i '^Pages' | awk '{print $2}' || echo ''); [ -n \"$pages\" ] && extra=\"PAGES:$pages\";; "
+        mcmd += "esac; "
+        mcmd += "if [ -d \"$f\" ]; then cnt=$(ls -A -- \"$f\" 2>/dev/null | wc -l | tr -d ' '); extra=\"ITEMS:$cnt\"; fi; "
+        mcmd += "echo \"SIZE:$size\"; echo \"MTIME:$mtime\"; echo \"PERMS:$perms\"; echo \"MIME:$mime\"; "
+        mcmd += "[ -n \"$extra\" ] && echo \"$extra\""
+        metaProc.command = ["bash", "-lc", mcmd]
+        metaProc.running = true
+    }
+
+    // ---- Drive switcher (transient overlay over the panel) ----
+    // No automount: the list is fetched fresh per summon via lsblk -J.
+    // Mounting is delegated to udisks2 (same service Files uses); if polkit
+    // needs auth, the system agent prompts — this plugin never handles secrets.
+    // Encrypted volumes are never prompted here: they hand off to Files.
+    function openDrives() {
+        if (renameOpen || createOpen || helpOpen || trashConfirmOpen || multiConfirmOpen) return
+        drivesOpen = true
+        drivesSelected = 0
+        drivesMounting = false
+        drivesMountRequest = ""
+        drivesQuietRefresh = false
+        drivesRefreshPending = false
+        drivesSuppressRefresh = false
+        fetchDrives()
+        // Push channel for plug/unplug while open; killed on close.
+        if (drivesMonitorProc.running) drivesMonitorProc.running = false
+        drivesMonitorProc.running = true
+        Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
+    }
+    function closeDrives() {
+        drivesOpen = false
+        if (drivesFetchProc.running) drivesFetchProc.running = false
+        if (drivesMountProc.running) drivesMountProc.running = false
+        if (drivesMonitorProc.running) drivesMonitorProc.running = false
+        drivesMonitorDebounce.stop()
+        drivesMounting = false
+        drivesMountRequest = ""
+        Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
+    }
+    function toggleDrives() {
+        if (drivesOpen) closeDrives()
+        else openDrives()
+    }
+    function fetchDrives() {
+        drivesLoading = true
+        drivesQuietRefresh = false
+        drivesRefreshPending = false
+        // Keep pinned rows visible while the fetch runs
+        rebuildDrivesModel([], true)
+        drivesFetchProc.command = ["bash", "-lc", "lsblk -J -o NAME,FSTYPE,LABEL,SIZE,MOUNTPOINT,UUID,PARTTYPE,TRAN 2>/dev/null"]
+        drivesFetchProc.running = true
+    }
+    // Background refresh: same fetch, but the painted list stays until the
+    // new parse swaps in — no flicker, selection and errors preserved.
+    function fetchDrivesQuiet() {
+        if (!drivesOpen) return
+        if (drivesFetchProc.running) { drivesRefreshPending = true; return }
+        drivesQuietRefresh = true
+        drivesRefreshPending = false
+        drivesFetchProc.command = ["bash", "-lc", "lsblk -J -o NAME,FSTYPE,LABEL,SIZE,MOUNTPOINT,UUID,PARTTYPE,TRAN 2>/dev/null"]
+        drivesFetchProc.running = true
+    }
+    function drivesMonitorEvent(line) {
+        if (!drivesOpen) return
+        if (!String(line || "").trim()) return
+        drivesMonitorDebounce.restart()
+    }
+    function drivesMonitorRefresh() {
+        if (!drivesOpen) return
+        // Our own successful mount dismisses the overlay first; a queued
+        // monitor burst must not resurrect anything.
+        if (drivesSuppressRefresh) { drivesSuppressRefresh = false; return }
+        // A mount attempt in flight owns its row state — don't clobber it.
+        if (drivesMounting) return
+        fetchDrivesQuiet()
+    }
+    // Removable-only safety net: browsing a vanished /media|/run/media tree
+    // falls back home. $HOME and / can never trigger this.
+    function guardCurrentDir(devs) {
+        var cd = String(currentDir || "")
+        if (cd.indexOf("/media/") !== 0 && cd.indexOf("/run/media/") !== 0) return
+        for (var i = 0; i < devs.length; i++) {
+            var mp = String(devs[i].mpoint || "")
+            if (mp && (cd === mp || cd.indexOf(mp + "/") === 0)) return
+        }
+        navigateToDir(home)
+    }
+    function drivesSkipParttype(pt) {
+        var t = String(pt || "").toLowerCase()
+        if (!t) return false
+        // EFI system partition, Microsoft reserved, Windows recovery
+        // (verified against live lsblk PARTTYPE output; lowercase compare)
+        if (t.indexOf("c12a7328-f81f-11d2-ba4b-00a0c93ec93b") === 0) return true
+        if (t.indexOf("e3c9e316-0b5c-4db8-817d-f92df00215ae") === 0) return true
+        if (t.indexOf("de94bba4-06d1-4d40-a16a-bfd50179d6ac") === 0) return true
+        return false
+    }
+    function drivesCollect(devs, out) {
+        for (var i = 0; i < devs.length; i++) {
+            var d = devs[i]
+            var name = String(d.name || "")
+            var fstype = String(d.fstype || "")
+            var label = String(d.label || "")
+            var size = String(d.size || "")
+            var mp = String(d.mountpoint || "")
+            var pt = String(d.parttype || d.PartType || "")
+            var tran = String(d.tran || d.Tran || "").toLowerCase()
+            if (d.children && d.children.length) drivesCollect(d.children, out)
+            // Containers / non-filesystems first
+            if (!fstype) continue
+            if (fstype === "swap" || fstype === "crypto_LUKS") {
+                if (fstype === "crypto_LUKS" && name) {
+                    out.push({ device: "/dev/" + name, fstype: fstype, label: label, size: size, mpoint: "", locked: true, tran: tran })
+                }
+                continue
+            }
+            // Mounted anywhere system-owned (/, /boot, subvol quirks) is never listed;
+            // udisks/removable mounts live under /media or /run/media and are listed.
+            if (mp) {
+                if (mp.indexOf("/media/") === 0 || mp.indexOf("/run/media/") === 0) {
+                    out.push({ device: name ? "/dev/" + name : "", fstype: fstype, label: label, size: size, mpoint: mp, locked: false, tran: tran })
+                }
+                continue
+            }
+            // Unmounted candidates: known data filesystems, minus firmware/reserved parts
+            if (drivesSkipParttype(pt)) continue
+            var fl = fstype.toLowerCase()
+            if (fl !== "vfat" && fl !== "ntfs" && fl !== "exfat" && fl !== "ext4" && fl !== "btrfs" && fl !== "xfs" && fl !== "hfsplus") continue
+            if (!name) continue
+            out.push({ device: "/dev/" + name, fstype: fstype, label: label, size: size, mpoint: "", locked: false, tran: tran })
+        }
+    }
+    // Monochrome drive glyphs: symbolic theme icon flattened into the
+    // foreground color, so rows follow theme changes exactly like text does.
+    // Symbolic-first with fallback to the full-color name, then no icon.
+    function driveIconSource(base) {
+        var b = String(base || "")
+        if (!b) return ""
+        try {
+            var sym = Quickshell.iconPath(b + "-symbolic", true)
+            if (sym && String(sym).length) return sym
+            var full = Quickshell.iconPath(b, true)
+            if (full && String(full).length) return full
+        } catch(e) {}
+        return ""
+    }
+    function rebuildDrivesModel(devs, loading) {
+        drivesModel.clear()
+        drivesModel.append({ dname: "Home", ddetail: tildeCollapse(home), device: "", mpoint: home, mounted: true, fstype: "", derr: "", dkind: "home", diconName: "user-home" })
+        drivesModel.append({ dname: "System root", ddetail: "/", device: "", mpoint: "/", mounted: true, fstype: "", derr: "", dkind: "root", diconName: "computer" })
+        if (loading) {
+            drivesModel.append({ dname: "Loading drives…", ddetail: "", device: "", mpoint: "", mounted: false, fstype: "", derr: "", dkind: "loading", diconName: "system-search" })
+        }
+        for (var i = 0; i < devs.length; i++) {
+            var d = devs[i]
+            var title = d.label ? d.label : Fuzzy.basename(d.mpoint || d.device)
+            if (!title) title = d.device
+            var sub = d.mpoint ? tildeCollapse(d.mpoint) + "  •  " + d.fstype + (d.size ? "  •  " + d.size : "") : (d.locked ? "Encrypted  •  " + d.fstype : "Not mounted  •  " + d.fstype + (d.size ? "  •  " + d.size : ""))
+            // Monochrome theme icons only (no emoji): one stable glyph per
+            // drive by transport — mounted state is carried by dimming alone.
+            var glyph = "drive-harddisk"
+            if (d.locked) glyph = "object-locked"
+            else if (String(d.tran || "") === "usb") glyph = "drive-removable-media"
+            drivesModel.append({ dname: title, ddetail: sub, device: d.device, mpoint: d.mpoint, mounted: !!d.mpoint, fstype: d.fstype, derr: "", dkind: d.locked ? "locked" : "drive", diconName: glyph })
+        }
+        if (drivesSelected >= drivesModel.count) drivesSelected = Math.max(0, drivesModel.count - 1)
+    }
+    function drivesMove(delta) {
+        if (drivesModel.count === 0) return
+        var n = drivesModel.count
+        drivesSelected = (drivesSelected + delta + n) % n
+        // Skip the transient loading row
+        var guard = 0
+        while (guard < n) {
+            var r = null
+            try { r = drivesModel.get(drivesSelected) } catch(e) { r = null }
+            if (r && String(r.dkind || "") === "loading") drivesSelected = (drivesSelected + (delta < 0 ? -1 : 1) + n) % n
+            else break
+            guard++
+        }
+        drivesList.positionViewAtIndex(drivesSelected, ListView.Contain)
+    }
+    function confirmDrives() {
+        if (!drivesOpen || drivesModel.count === 0) return
+        if (drivesMounting) return
+        var row = null
+        try { row = drivesModel.get(drivesSelected) } catch(e) { row = null }
+        if (!row) return
+        var kind = String(row.dkind || "")
+        if (kind === "loading") return
+        if (kind === "home" || kind === "root") {
+            var dest = String(row.mpoint || home)
+            closeDrives()
+            if (openWithMode) exitOpenWithMode()
+            navigateToDir(dest)
+            return
+        }
+        var mp = String(row.mpoint || "")
+        if (mp) {
+            closeDrives()
+            if (openWithMode) exitOpenWithMode()
+            navigateToDir(mp)
+            return
+        }
+        if (kind === "locked") {
+            // Encrypted: hand off to Files so the system owns the passphrase UI.
+            // Dismiss everything so Files is usable (overlay holds exclusive focus).
+            var dev = String(row.device || "")
+            drivesModel.setProperty(drivesSelected, "derr", "Encrypted — opening Files to unlock" + (dev ? " " + dev : ""))
+            Util.execDetached("xdg-open " + Util.shellQuote(home) + " >/dev/null 2>&1 &")
+            closeDrives()
+            root.dismiss()
+            return
+        }
+        // Unmounted data volume: mount via udisks2; polkit agent handles any auth.
+        var dev2 = String(row.device || "")
+        if (!dev2) return
+        // Surface failure? Second Enter hands off to Files instead of retrying.
+        if (String(row.derr || "") !== "") {
+            Util.execDetached("xdg-open " + Util.shellQuote(home) + " >/dev/null 2>&1 &")
+            closeDrives()
+            root.dismiss()
+            return
+        }
+        drivesMounting = true
+        drivesMountRequest = dev2
+        drivesModel.setProperty(drivesSelected, "derr", "")
+        drivesModel.setProperty(drivesSelected, "ddetail", "Mounting…")
+        drivesMountProc.command = ["bash", "-lc", "udisksctl mount -b " + Util.shellQuote(dev2) + " 2>&1"]
+        drivesMountProc.running = true
+    }
+
+    // ---- Preview pipeline (single selection, debounced, cancellable) ----
+    onSelectedIndexChanged: schedulePreview()
+    onCursorActiveChanged: schedulePreview()
+    onLayoutSerialChanged: { pruneSelection(); schedulePreview() }
+    onShowPreviewChanged: schedulePreview()
+    onOpenWithModeChanged: schedulePreview()
+    onIsSearchingChanged: schedulePreview()
+
+    Timer {
+        id: previewDebounce
+        interval: 150
+        repeat: false
+        onTriggered: root.doPreview()
+    }
+
+    Process {
+        id: previewCacheProc
+        command: ["bash", "-lc", "mkdir -p " + Util.shellQuote(previewCacheDir)]
+    }
+
+    ListModel {
+        id: drivesModel
+        ListElement { dname: ""; ddetail: ""; device: ""; mpoint: ""; mounted: false; fstype: ""; derr: ""; dkind: ""; diconName: "" }
+        Component.onCompleted: clear()
+    }
+
+    Process {
+        id: drivesFetchProc
+        stdout: StdioCollector { id: drivesFetchOutput; waitForEnd: true }
+        onExited: function(code) {
+            var wasQuiet = root.drivesQuietRefresh
+            root.drivesQuietRefresh = false
+            if (!root.drivesOpen) {
+                if (root.drivesRefreshPending) { root.drivesRefreshPending = false }
+                return
+            }
+            // Snapshot selection + per-row errors before the swap (quiet only)
+            var selDevice = ""
+            var errMap = {}
+            if (wasQuiet) {
+                try {
+                    var cur = drivesModel.get(root.drivesSelected)
+                    if (cur) selDevice = String(cur.device || "")
+                    for (var s = 0; s < drivesModel.count; s++) {
+                        var er = drivesModel.get(s)
+                        if (er && String(er.derr || "") !== "" && String(er.device || "") !== "") {
+                            errMap[String(er.device)] = String(er.derr)
+                        }
+                    }
+                } catch(e) {}
+            }
+            root.drivesLoading = false
+            var raw = String(drivesFetchOutput.text || "").trim()
+            var found = []
+            if (raw) {
+                try {
+                    var data = JSON.parse(raw)
+                    var devs = (data && data.blockdevices) ? data.blockdevices : []
+                    root.drivesCollect(devs, found)
+                } catch(e) { found = [] }
+            }
+            root.rebuildDrivesModel(found, false)
+            if (wasQuiet) {
+                var restored = false
+                for (var i = 0; i < drivesModel.count; i++) {
+                    var r = null
+                    try { r = drivesModel.get(i) } catch(e) { r = null }
+                    if (!r) continue
+                    var rd = String(r.device || "")
+                    if (rd && errMap[rd]) drivesModel.setProperty(i, "derr", errMap[rd])
+                    if (!restored && selDevice !== "" && rd && rd === selDevice) {
+                        root.drivesSelected = i
+                        restored = true
+                    }
+                }
+                try { drivesList.positionViewAtIndex(root.drivesSelected, ListView.Contain) } catch(e) {}
+            }
+            root.guardCurrentDir(found)
+            if (root.drivesRefreshPending) {
+                root.drivesRefreshPending = false
+                root.fetchDrivesQuiet()
+            }
+        }
+    }
+
+    Process {
+        id: drivesMonitorProc
+        command: ["bash", "-lc", "udisksctl monitor 2>&1"]
+        stdout: SplitParser { onRead: function(line){ root.drivesMonitorEvent(line) } }
+    }
+
+    Timer {
+        id: drivesMonitorDebounce
+        interval: 400
+        repeat: false
+        onTriggered: root.drivesMonitorRefresh()
+    }
+
+    Process {
+        id: drivesMountProc
+        stdout: StdioCollector { id: drivesMountOutput; waitForEnd: true }
+        stderr: StdioCollector { id: drivesMountError; waitForEnd: true }
+        onExited: function(code) {
+            var req = String(root.drivesMountRequest || "")
+            root.drivesMounting = false
+            if (!req || !root.drivesOpen) { root.drivesMountRequest = ""; return }
+            var out = String(drivesMountOutput.text || "") + "\n" + String(drivesMountError.text || "")
+            // udisksctl prints: Mounted /dev/XXX at /run/media/…/.
+            var at = out.lastIndexOf(" at ")
+            var mp = ""
+            if (at !== -1) {
+                mp = out.slice(at + 4).trim()
+                if (mp.charAt(mp.length - 1) === ".") mp = mp.slice(0, -1).trim()
+                mp = mp.split("\n")[0].trim()
+            }
+            if (mp && mp.charAt(0) === "/") {
+                var target = mp
+                root.drivesMountRequest = ""
+                // Our own mount will echo through the monitor burst — suppress it.
+                root.drivesSuppressRefresh = true
+                root.closeDrives()
+                if (root.openWithMode) root.exitOpenWithMode()
+                root.navigateToDir(target)
+            } else {
+                // Keep overlay open with inline, recoverable error.
+                // Second Enter on this row hands off to Files.
+                var msg = out.trim().split("\n").filter(function(l){ return l.trim() !== "" })
+                var short = msg.length ? msg[msg.length - 1].trim().slice(0, 120) : "Mount failed"
+                if (/hibernat/i.test(out)) short = "Windows is hibernated — shut it down fully, then retry"
+                else if (/locked|crypt|passphrase|luks/i.test(out)) short = "Encrypted — Enter again opens Files to unlock"
+                else if (/not authorized|auth/i.test(out)) short = "Not authorized — Enter again opens Files"
+                for (var i = 0; i < drivesModel.count; i++) {
+                    var r = null
+                    try { r = drivesModel.get(i) } catch(e) { r = null }
+                    if (r && String(r.device || "") === req) {
+                        drivesModel.setProperty(i, "derr", short)
+                        var base = String(r.ddetail || "")
+                        var cut = base.indexOf("Mounting…")
+                        if (cut !== -1) drivesModel.setProperty(i, "ddetail", base.slice(0, cut).trim())
+                        break
+                    }
+                }
+                root.drivesMountRequest = ""
+                try { drivesList.positionViewAtIndex(root.drivesSelected, ListView.Contain) } catch(e) {}
+                // Reconcile with reality after a failure (a removal may have
+                // raced the mount); errors are preserved by device.
+                root.fetchDrivesQuiet()
+            }
+        }
+    }
+
+    Process {
+        id: previewProc
+        stdout: StdioCollector { id: previewOutput; waitForEnd: true }
+        onExited: function(code) {
+            var req = String(root.previewRequest || "")
+            var kind = String(root.previewRequestKind || "")
+            if (!req || req !== String(root.previewPath || "")) return
+            if (!root.opened || root.openWithMode) return
+            var raw = String(previewOutput.text || "")
+            // StdioCollector appends; trim trailing newline only for markers
+            var trimmed = raw.trim()
+            if (kind === "text") {
+                // Keep first 4k as-is (may contain newlines); cap for display
+                var snippet = raw
+                if (snippet.length > 4096) snippet = snippet.slice(0, 4096)
+                root.previewText = snippet
+                root.previewLoading = false
+            } else if (kind === "video" || kind === "pdf") {
+                if (trimmed.indexOf("THUMB:") === 0) {
+                    var thumb = trimmed.slice(6).trim()
+                    if (thumb) {
+                        root.previewUrl = Util.fileUrl(thumb)
+                        root.previewLoading = false
+                    } else {
+                        root.previewLoading = false
+                    }
+                } else {
+                    root.previewLoading = false
+                }
+            } else if (kind === "folder") {
+                var cnt = trimmed.replace(/[^0-9]/g, "")
+                if (cnt !== "") root.previewMetaExtra = "ITEMS:" + cnt
+                root.previewLoading = false
+            } else {
+                root.previewLoading = false
+            }
+        }
+    }
+
+    Process {
+        id: metaProc
+        stdout: StdioCollector { id: metaOutput; waitForEnd: true }
+        onExited: function(code) {
+            var req = String(root.previewMetaRequest || "")
+            if (!req || req !== String(root.previewPath || "")) return
+            if (!root.opened) return
+            var lines = String(metaOutput.text || "").split("\n")
+            for (var i = 0; i < lines.length; i++) {
+                var line = String(lines[i] || "").trim()
+                if (!line) continue
+                if (line.indexOf("SIZE:") === 0) {
+                    root.previewMetaSize = root.humanizeSize(line.slice(5).trim())
+                } else if (line.indexOf("MTIME:") === 0) {
+                    root.previewMetaModified = root.formatMtime(line.slice(6).trim())
+                } else if (line.indexOf("PERMS:") === 0) {
+                    root.previewMetaPerms = line.slice(6).trim()
+                } else if (line.indexOf("MIME:") === 0) {
+                    var m = line.slice(5).trim()
+                    if (m) root.previewMetaType = m
+                } else if (line.indexOf("DIM:") === 0) {
+                    root.previewMetaExtra = line.trim()
+                } else if (line.indexOf("MEDIA:") === 0) {
+                    root.previewMetaExtra = line.trim().slice(0, 80)
+                } else if (line.indexOf("PAGES:") === 0) {
+                    root.previewMetaExtra = line.trim()
+                } else if (line.indexOf("ITEMS:") === 0) {
+                    // Only overwrite if folder (previewProc may have set it already)
+                    if (root.previewKind === "folder") root.previewMetaExtra = line.trim()
+                }
+            }
+        }
     }
 
     // ---- Models ----
@@ -1556,7 +2641,7 @@ Item {
             Item {
                 id: keyCatcher
                 anchors.fill: parent
-                z: (root.trashConfirmOpen || root.helpOpen || root.renameOpen || root.createOpen) ? 20 : 0
+                z: (root.trashConfirmOpen || root.helpOpen || root.renameOpen || root.createOpen || root.drivesOpen) ? 20 : 0
                 focus: true
                 Keys.priority: Keys.BeforeItem
                 Keys.onPressed: function(event){
@@ -1608,6 +2693,45 @@ Item {
                         if (trashConfirm.handleKey(event)) event.accepted = true
                         return
                     }
+                    // Multi-open confirm has the same priority
+                    if (multiConfirmOpen) {
+                        if (multiConfirm.handleKey(event)) event.accepted = true
+                        return
+                    }
+                    // Drive switcher has priority while open (arrows/enter/esc/numbers/mouse)
+                    if (drivesOpen) {
+                        if (event.key === Qt.Key_Escape) {
+                            closeDrives(); event.accepted = true; return
+                        } else if (event.key === Qt.Key_Up) {
+                            drivesMove(-1); event.accepted = true; return
+                        } else if (event.key === Qt.Key_Down) {
+                            drivesMove(1); event.accepted = true; return
+                        } else if (event.key === Qt.Key_Home) {
+                            drivesSelected = 0; try { drivesList.positionViewAtIndex(0, ListView.Contain) } catch(e) {}
+                            event.accepted = true; return
+                        } else if (event.key === Qt.Key_End) {
+                            drivesSelected = Math.max(0, drivesModel.count - 1); try { drivesList.positionViewAtIndex(drivesSelected, ListView.Contain) } catch(e) {}
+                            event.accepted = true; return
+                        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            confirmDrives(); event.accepted = true; return
+                        } else if (event.text && event.text.length === 1 && event.text >= "1" && event.text <= "9" && (event.modifiers === Qt.NoModifier)) {
+                            var want = Number(event.text) - 1
+                            // 1-2 are pinned rows only when no drives fetched yet; map directly
+                            if (want >= 0 && want < drivesModel.count) {
+                                drivesSelected = want
+                                try { drivesList.positionViewAtIndex(drivesSelected, ListView.Contain) } catch(e) {}
+                                confirmDrives()
+                            }
+                            event.accepted = true; return
+                        }
+                        event.accepted = true; return
+                    }
+                    // Drive switcher summon: Ctrl+B (transient overlay, no layout change)
+                    if ((event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.ShiftModifier) && !(event.modifiers & Qt.AltModifier) && event.key === Qt.Key_B) {
+                        root.toggleDrives()
+                        event.accepted = true
+                        return
+                    }
                     // Help toggle — F1 or Ctrl+/ (also Ctrl+? via Question with Ctrl)
                     if (event.key === Qt.Key_F1
                         || (event.key === Qt.Key_Slash && (event.modifiers & Qt.ControlModifier))
@@ -1622,7 +2746,19 @@ Item {
                     }
                     // Open With mode has its own handling
                     if (openWithMode) {
-                        if (event.key === Qt.Key_Escape) {
+                        if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_P) {
+                            root.togglePreview()
+                            event.accepted = true
+                            return
+                        } else if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_V) {
+                            root.toggleView()
+                            event.accepted = true
+                            return
+                        } else if ((event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.ShiftModifier) && !(event.modifiers & Qt.AltModifier) && event.key === Qt.Key_B) {
+                            root.toggleDrives()
+                            event.accepted = true
+                            return
+                        } else if (event.key === Qt.Key_Escape) {
                             exitOpenWithMode()
                             event.accepted = true
                             return
@@ -1662,6 +2798,39 @@ Item {
                         event.accepted = true
                         return
                     }
+                    // Preview toggle: Ctrl+Shift+P (remembered, default on; help menu only)
+                    if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_P) {
+                        root.togglePreview()
+                        event.accepted = true
+                        return
+                    }
+                    // View toggle: Ctrl+Shift+V list/grid (remembered, default list)
+                    if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_V) {
+                        root.toggleView()
+                        event.accepted = true
+                        return
+                    }
+                    // Multi-select: Ctrl+Space toggles the cursor row
+                    // (plain Space keeps typing into the filter)
+                    if ((event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_Space) {
+                        root.toggleSelect(selectedIndex)
+                        event.accepted = true
+                        return
+                    }
+                    // Multi-select: Ctrl+A checks every visible row
+                    if ((event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_A) {
+                        if (displayModel.count > 0 && cursorActive) {
+                            var all = {}
+                            for (var ai = 0; ai < displayModel.count; ai++) {
+                                var ap = root.rowPathAt(ai)
+                                if (ap) all[ap] = true
+                            }
+                            root.setSelectedPaths(all)
+                            anchorIndex = selectedIndex
+                        }
+                        event.accepted = true
+                        return
+                    }
                     // Hidden toggle: Ctrl+H (without Shift) or Ctrl+Dot
                     if ((event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.ShiftModifier) && (event.key === Qt.Key_H || event.key === Qt.Key_Period)) {
                         root.toggleHidden()
@@ -1673,7 +2842,9 @@ Item {
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_C) {
                         // Copy path (Ctrl+Shift+C) — swapped per request
-                        if (displayModel.count>0 && cursorActive) {
+                        if (selectedCount > 0) {
+                            root.copyPaths(actionTargets().map(function(t){ return t.path }))
+                        } else if (displayModel.count>0 && cursorActive) {
                             var row = displayModel.get(selectedIndex)
                             root.copyPath(row.path)
                         } else if (filterText) {
@@ -1682,14 +2853,24 @@ Item {
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_C) {
                         // Copy file (uri-list) for paste (Ctrl+C) — stay open + go home for paste
-                        if (displayModel.count>0 && cursorActive) {
+                        if (selectedCount > 0) {
+                            var cfiles = actionTargets().map(function(t){ return t.path })
+                            copyFilesToClipboard(cfiles, "copy")
+                            clearSelection()
+                            navigateToDir(home)
+                        } else if (displayModel.count>0 && cursorActive) {
                             var crow = displayModel.get(selectedIndex)
                             if (crow.path) copyFile(crow.path)
                         }
                         event.accepted = true
                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_X) {
                         // Cut file
-                        if (displayModel.count>0 && cursorActive) {
+                        if (selectedCount > 0) {
+                            var xfiles = actionTargets().map(function(t){ return t.path })
+                            copyFilesToClipboard(xfiles, "cut")
+                            clearSelection()
+                            navigateToDir(home)
+                        } else if (displayModel.count>0 && cursorActive) {
                             var xrow = displayModel.get(selectedIndex)
                             if (xrow.path) cutFile(xrow.path)
                         }
@@ -1764,20 +2945,87 @@ Item {
                     } else if (Util.editsFilter(event, root.filterText)) {
                         root.setFilter(Util.editedFilter(event, root.filterText))
                         event.accepted = true
-                    } else if (event.key === Qt.Key_Left && !root.filterText) {
-                        root.goBack()
+                    } else if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_Up) {
+                        // Ctrl+Shift: grow the set without dropping extras
+                        if (root.effectiveGrid) root.shiftGridRow(-1, true)
+                        else root.shiftSelect(-1, true)
                         event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_Down) {
+                        if (root.effectiveGrid) root.shiftGridRow(1, true)
+                        else root.shiftSelect(1, true)
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_Left) {
+                        if (root.effectiveGrid) root.shiftGridLinear(-1, true)
+                        else root.shiftSelect(-1, true)
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_Right) {
+                        if (root.effectiveGrid) root.shiftGridLinear(1, true)
+                        else root.shiftSelect(1, true)
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_Up) {
+                        // Ctrl+arrows: move the cursor, keep the set
+                        if (root.effectiveGrid) root.selectGridRow(-1, true)
+                        else root.select(-1, true)
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_Down) {
+                        if (root.effectiveGrid) root.selectGridRow(1, true)
+                        else root.select(1, true)
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_Left) {
+                        if (root.effectiveGrid) root.selectGridLinear(-1, true)
+                        else root.select(-1, true)
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ControlModifier) && !(event.modifiers & Qt.ShiftModifier) && event.key === Qt.Key_Right) {
+                        if (root.effectiveGrid) root.selectGridLinear(1, true)
+                        else root.select(1, true)
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ShiftModifier) && !(event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_Up) {
+                        // Shift: extend the range from the anchor
+                        if (root.effectiveGrid) root.shiftGridRow(-1)
+                        else root.shiftSelect(-1)
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ShiftModifier) && !(event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_Down) {
+                        if (root.effectiveGrid) root.shiftGridRow(1)
+                        else root.shiftSelect(1)
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ShiftModifier) && !(event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_Left) {
+                        if (root.effectiveGrid) root.shiftGridLinear(-1)
+                        else root.shiftSelect(-1)
+                        event.accepted = true
+                    } else if ((event.modifiers & Qt.ShiftModifier) && !(event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_Right) {
+                        if (root.effectiveGrid) root.shiftGridLinear(1)
+                        else root.shiftSelect(1)
+                        event.accepted = true
+                    } else if (event.key === Qt.Key_Left) {
+                        // Grid: ←/→ move the cursor (Up/Down jump a row).
+                        // List: ← with empty filter goes to the parent folder.
+                        if (root.effectiveGrid) {
+                            root.selectGridLinear(-1)
+                            event.accepted = true
+                        } else if (!root.filterText) {
+                            root.goBack()
+                            event.accepted = true
+                        }
+                    } else if (event.key === Qt.Key_Right) {
+                        if (root.effectiveGrid) {
+                            root.selectGridLinear(1)
+                            event.accepted = true
+                        }
                     } else if (event.key === Qt.Key_Up) {
-                        root.select(-1)
+                        if (root.effectiveGrid) root.selectGridRow(-1)
+                        else root.select(-1)
                         event.accepted = true
                     } else if (event.key === Qt.Key_Down) {
-                        root.select(1)
+                        if (root.effectiveGrid) root.selectGridRow(1)
+                        else root.select(1)
                         event.accepted = true
                     } else if (event.key === Qt.Key_PageUp) {
-                        root.select(-6)
+                        if (root.effectiveGrid) root.selectGridPage(-1)
+                        else root.select(-6)
                         event.accepted = true
                     } else if (event.key === Qt.Key_PageDown) {
-                        root.select(6)
+                        if (root.effectiveGrid) root.selectGridPage(1)
+                        else root.select(6)
                         event.accepted = true
                     } else if (event.key === Qt.Key_Home) {
                         root.selectAbsolute(0)
@@ -1790,7 +3038,8 @@ Item {
                         if (root.filterText && Fuzzy.isPathLike(root.filterText)) {
                             root.handleEnterOnFilter()
                         } else if (root.cursorActive) {
-                            root.activateIndex(root.selectedIndex)
+                            if (selectedCount > 0) root.activateSelection()
+                            else root.activateIndex(root.selectedIndex)
                         } else if (displayModel.count>0) {
                             root.cursorActive=true
                         }
@@ -1808,7 +3057,7 @@ Item {
                     anchors.fill: parent
                     opened: trashConfirmOpen
                     z: 30
-                    message: trashTarget ? ("Move “" + String(trashTarget.name||"") + "” to Trash?\nRecoverable in Trash.") : "Move to Trash?"
+                    message: trashTarget ? ("Move “" + String(trashTarget.name||"") + "” to Trash?\nRecoverable in Trash.") : (multiTrashPaths.length > 0 ? trashMultiMessage() : "Move to Trash?")
                     confirmText: "Move to Trash"
                     cancelText: "Cancel"
                     background: Color.menu.background
@@ -1820,6 +3069,39 @@ Item {
                     cornerRadius: root.cornerRadius
                     onCanceled: cancelTrashConfirm()
                     onConfirmed: confirmTrash()
+                }
+
+                ConfirmDialog {
+                    id: multiConfirm
+                    anchors.fill: parent
+                    opened: multiConfirmOpen
+                    z: 30
+                    message: multiConfirmMessage !== "" ? multiConfirmMessage : "Open?"
+                    confirmText: "Open all"
+                    cancelText: "Cancel"
+                    background: Color.menu.background
+                    foreground: Color.menu.text
+                    scrim: Util.alpha(Color.menu.background, 0.6)
+                    selectedBackground: Color.menu.selectedBackground
+                    selectedText: Color.menu.selectedText
+                    fontFamily: root.fontFamily
+                    cornerRadius: root.cornerRadius
+                    onCanceled: {
+                        multiConfirmOpen = false
+                        pendingMultiOpen = []
+                        pendingMultiDir = ""
+                        multiConfirmMessage = ""
+                        Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
+                    }
+                    onConfirmed: {
+                        var f = pendingMultiOpen
+                        var d = pendingMultiDir
+                        multiConfirmOpen = false
+                        pendingMultiOpen = []
+                        pendingMultiDir = ""
+                        multiConfirmMessage = ""
+                        doMultiOpen(f, d)
+                    }
                 }
 
                 // Rename overlay — scrim + card with inline input and error
@@ -2254,13 +3536,42 @@ Item {
                                             Column {
                                                 width: parent.width
                                                 spacing: Style.space(6)
+                                                Text { textFormat: Text.PlainText; text: "Multi-select"; color: root.foreground; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.weight: Font.Medium }
+                                                Column {
+                                                    width: parent.width
+                                                    spacing: 3
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+Click / Ctrl+Space  — Toggle file in set"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Shift+Click / Shift+↑↓←→  — Range from anchor"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+↑↓←→  — Move keeping set (Shift adds range)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+A  — All visible • Esc — Clear set"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Enter — Open set (10+ asks) • Ctrl+D — Trash set (one confirm)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                }
+                                            }
+                                            Column {
+                                                width: parent.width
+                                                spacing: Style.space(6)
                                                 Text { textFormat: Text.PlainText; text: "View / Go"; color: root.foreground; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.weight: Font.Medium }
                                                 Column {
                                                     width: parent.width
                                                     spacing: 3
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+H / Ctrl+.  — Toggle hidden files"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+Shift+V  — Toggle list / tile view (remembered)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Tiles: ←/→ move, ↑/↓ jump a row, ← never leaves the folder"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+Shift+P  — Toggle preview pane (remembered, default on)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+Shift+H  — Go home (~)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                     Text { width: parent.width; textFormat: Text.PlainText; text: "Esc  — Back (Open With) / Close (browse)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                }
+                                            }
+                                            Column {
+                                                width: parent.width
+                                                spacing: Style.space(6)
+                                                Text { textFormat: Text.PlainText; text: "Drives"; color: root.foreground; opacity: 0.6; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.weight: Font.Medium }
+                                                Column {
+                                                    width: parent.width
+                                                    spacing: 3
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Ctrl+B  — Drives overlay (Home, root, USB + fixed drives)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Enter  — Open / mount via system (no passwords in Omafinder)"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                                                    Text { width: parent.width; textFormat: Text.PlainText; text: "Esc  — Close drives"; color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
                                                 }
                                             }
                                             Column {
@@ -2308,6 +3619,180 @@ Item {
                         }
                     }
                 }
+
+                // Drive switcher — transient overlay over the panel (no layout change).
+                // Slides in from the left; selecting a drive dismisses it.
+                Item {
+                    id: drivesOverlay
+                    anchors.fill: parent
+                    visible: drivesOpen
+                    z: 34
+
+                    Rectangle {
+                        anchors.fill: parent
+                        color: Util.alpha(Color.menu.background, 0.7)
+                        MouseArea { anchors.fill: parent; onClicked: closeDrives() }
+
+                        BorderSurface {
+                            id: drivesCard
+                            width: Math.min(parent.width - Style.space(32), Style.space(460))
+                            height: Math.min(parent.height - Style.space(32), Style.space(96) + Math.min(Math.max(drivesModel.count, 1), 8) * Math.max(Style.space(46), Style.font.body + Style.font.caption + 10) + Style.space(8))
+                            anchors.centerIn: parent
+                            anchors.horizontalCenterOffset: drivesOpen ? 0 : -Style.space(24)
+                            Behavior on anchors.horizontalCenterOffset { NumberAnimation { duration: root.animationDurationIn; easing.type: Easing.OutCubic } }
+                            // Fully opaque like the delete confirm — translucent
+                            // theme backgrounds let the file list bleed through.
+                            color: Util.alpha(root.background, 1)
+                            borderSpec: Border.flat(root.selectedText, Style.normalBorderWidth)
+                            padding: Style.space(16)
+                            radius: root.cornerRadius
+                            MouseArea { anchors.fill: parent; onClicked: {} }
+
+                            Item {
+                                anchors.fill: parent
+                                anchors.topMargin: drivesCard.contentTopInset
+                                anchors.rightMargin: drivesCard.contentRightInset
+                                anchors.bottomMargin: drivesCard.contentBottomInset
+                                anchors.leftMargin: drivesCard.contentLeftInset
+
+                                Column {
+                                    anchors.fill: parent
+                                    spacing: Style.space(8)
+
+                                    Row {
+                                        width: parent.width
+                                        spacing: Style.space(8)
+                                        Text {
+                                            textFormat: Text.PlainText
+                                            text: "Drives"
+                                            color: root.foreground
+                                            font.family: root.fontFamily
+                                            font.pixelSize: Style.font.title
+                                            font.weight: Font.Medium
+                                        }
+                                        Item { width: Style.space(8); height: 1 }
+                                        Text {
+                                            textFormat: Text.PlainText
+                                            text: "Enter open • Esc close"
+                                            color: root.foreground
+                                            opacity: 0.45
+                                            font.family: root.fontFamily
+                                            font.pixelSize: Style.font.caption
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                    }
+
+                                    Rectangle { width: parent.width; height: 1; color: Util.alpha(root.foreground, 0.12) }
+
+                                    ListView {
+                                        id: drivesList
+                                        width: parent.width
+                                        height: parent.height - Style.space(28) - Style.space(9) - Style.space(8)
+                                        model: drivesModel
+                                        clip: true
+                                        spacing: root.rowSpacing
+                                        boundsBehavior: Flickable.StopAtBounds
+                                        delegate: BorderSurface {
+                                            id: drow
+                                            required property int index
+                                            required property string dname
+                                            required property string ddetail
+                                            required property string device
+                                            required property string mpoint
+                                            required property bool mounted
+                                            required property string fstype
+                                            required property string derr
+                                            required property string dkind
+                                            required property string diconName
+                                            readonly property bool hasCursor: drow.index === root.drivesSelected
+                                            width: ListView.view.width
+                                            height: root.rowHeight
+                                            radius: root.cornerRadius
+                                            color: drow.hasCursor ? root.selectedBackground : "transparent"
+                                            borderSpec: drow.hasCursor ? root.selectedBorderSpec : Border.none()
+
+                                            Row {
+                                                anchors.fill: parent
+                                                anchors.leftMargin: Style.space(10)
+                                                anchors.rightMargin: Style.space(10)
+                                                anchors.topMargin: Style.space(6)
+                                                anchors.bottomMargin: Style.space(6)
+                                                spacing: Style.space(10)
+                                                Image {
+                                                    id: driveIconImage
+                                                    width: Style.space(28)
+                                                    height: Style.space(28)
+                                                    visible: drow.diconName !== "" && root.driveIconSource(drow.diconName) !== ""
+                                                    source: visible ? root.driveIconSource(drow.diconName) : ""
+                                                    fillMode: Image.PreserveAspectFit
+                                                    asynchronous: true
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    opacity: drow.mounted || drow.dkind === "home" || drow.dkind === "root" ? 0.9 : 0.45
+                                                    // Flatten to a single foreground tone (alpha kept)
+                                                    layer.enabled: true
+                                                    layer.effect: MultiEffect {
+                                                        colorization: 1.0
+                                                        colorizationColor: root.foreground
+                                                    }
+                                                    onStatusChanged: if (status === Image.Error) visible = false
+                                                }
+                                                Text {
+                                                    visible: !driveIconImage.visible
+                                                    textFormat: Text.PlainText
+                                                    text: "·"
+                                                    color: drow.hasCursor ? root.selectedText : root.foreground
+                                                    opacity: 0.7
+                                                    font.family: root.fontFamily
+                                                    font.pixelSize: Style.font.iconLarge * 0.9
+                                                    width: Style.space(28)
+                                                    horizontalAlignment: Text.AlignHCenter
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                }
+                                                Column {
+                                                    width: parent.width - Style.space(28) - Style.space(10) - Style.space(8)
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    spacing: 2
+                                                    Text {
+                                                        textFormat: Text.PlainText
+                                                        width: parent.width
+                                                        text: (drow.index < 9 ? (drow.index + 1) + "  " : "") + drow.dname
+                                                        color: drow.hasCursor ? root.selectedText : root.foreground
+                                                        font.family: root.fontFamily
+                                                        font.pixelSize: Style.font.body
+                                                        font.weight: Font.Medium
+                                                        elide: Text.ElideMiddle
+                                                        opacity: drow.mounted || drow.dkind === "home" || drow.dkind === "root" ? 1.0 : 0.6
+                                                    }
+                                                    Text {
+                                                        textFormat: Text.PlainText
+                                                        width: parent.width
+                                                        text: drow.derr !== "" ? drow.derr : drow.ddetail
+                                                        color: drow.derr !== "" ? Color.urgent : root.foreground
+                                                        opacity: drow.derr !== "" ? 0.9 : 0.45
+                                                        font.family: root.fontFamily
+                                                        font.pixelSize: Style.font.caption
+                                                        elide: Text.ElideRight
+                                                    }
+                                                }
+                                            }
+
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                hoverEnabled: true
+                                                cursorShape: Qt.PointingHandCursor
+                                                onEntered: root.drivesSelected = drow.index
+                                                onClicked: {
+                                                    root.drivesSelected = drow.index
+                                                    root.confirmDrives()
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             Column {
@@ -2326,7 +3811,7 @@ Item {
                     Text {
                         textFormat: Text.PlainText
                         width: parent.width
-                        text: openWithMode ? ("Open with: " + Fuzzy.basename(openWithFile)) : (tildeCollapse(currentDir) + (showHidden ? "" : "  • hidden") + (isSearching ? "  • searching…" : "") + (clipboardPath ? "  • " + clipboardOp + ": " + Fuzzy.basename(clipboardPath) : ""))
+                        text: openWithMode ? ("Open with: " + Fuzzy.basename(openWithFile)) : (tildeCollapse(currentDir) + (showHidden ? "" : "  • hidden") + (selectedCount > 0 ? "  •  " + selectedCount + " selected" : "") + (isSearching ? "  • searching…" : "") + (clipboardPath ? "  •  " + clipboardOp + ": " + Fuzzy.basename(clipboardPath) + (clipboardPaths.length > 1 ? " (+" + (clipboardPaths.length - 1) + ")" : "") : ""))
                         color: root.foreground
                         opacity: 0.55
                         font.family: root.fontFamily
@@ -2394,14 +3879,21 @@ Item {
                     }
                 }
 
-                Item {
+                Row {
                     width: parent.width
-                    height: root.visibleRows * rowHeight + Math.max(0, root.visibleRows-1)*rowSpacing + 2
-                    clip: true
+                    height: root.contentRows * rowHeight + Math.max(0, root.contentRows-1)*rowSpacing + 2
+                    spacing: root.contentSpacing
+
+                    Item {
+                        id: listContainer
+                        width: parent.width - (root.previewVisible ? root.previewWidth + parent.spacing : 0)
+                        height: parent.height
+                        clip: true
 
                     ListView {
                         id: resultList
                         anchors.fill: parent
+                        visible: !root.effectiveGrid
                         model: displayModel
                         clip: true
                         spacing: root.rowSpacing
@@ -2419,10 +3911,11 @@ Item {
                             required property string iconName
                             readonly property bool hasCursor: root.cursorActive && row.index === root.selectedIndex
                             readonly property bool isApp: openWithMode && appId !== ""
+                            readonly property bool inSet: !!root.selectedPaths[path]
                             width: ListView.view.width
                             height: root.rowHeight
                             radius: root.cornerRadius
-                            color: row.hasCursor ? root.selectedBackground : "transparent"
+                            color: row.hasCursor ? root.selectedBackground : (row.inSet ? Util.alpha(root.selectedBackground, 0.35) : "transparent")
                             borderSpec: row.hasCursor ? root.selectedBorderSpec : Border.none()
 
                             Row {
@@ -2504,7 +3997,7 @@ Item {
                                     Text {
                                         textFormat: Text.PlainText
                                         width: parent.width
-                                        text: row.name
+                                        text: (row.inSet ? "● " : "") + row.name
                                         color: row.hasCursor ? root.selectedText : root.foreground
                                         font.family: root.fontFamily
                                         font.pixelSize: Style.font.body
@@ -2532,7 +4025,16 @@ Item {
                                 cursorShape: Qt.PointingHandCursor
                                 onEntered: root.selectFromPointer(row.index, row, {x: mouseX, y: mouseY})
                                 onPositionChanged: function(mouse){ root.selectFromPointer(row.index, row, mouse) }
-                                onClicked: {
+                                onClicked: function(mouse) {
+                                    // Modifier clicks manage the set; plain click opens
+                                    if (!openWithMode && (mouse.modifiers & Qt.ShiftModifier)) {
+                                        root.rangeSelectTo(row.index, (mouse.modifiers & Qt.ControlModifier))
+                                        return
+                                    }
+                                    if (!openWithMode && (mouse.modifiers & Qt.ControlModifier)) {
+                                        root.toggleSelect(row.index)
+                                        return
+                                    }
                                     root.cursorActive=true
                                     root.selectedIndex=row.index
                                     if (openWithMode) {
@@ -2544,6 +4046,133 @@ Item {
                                 onPressAndHold: {
                                     if (openWithMode) return
                                     root.copyPath(row.path)
+                                }
+                            }
+                        }
+                    }
+
+                    GridView {
+                        id: gridView
+                        anchors.fill: parent
+                        visible: root.effectiveGrid
+                        model: displayModel
+                        clip: true
+                        cellWidth: root.gridCellWidth
+                        cellHeight: root.cellHeight
+                        boundsBehavior: Flickable.StopAtBounds
+                        delegate: BorderSurface {
+                            id: gcell
+                            required property int index
+                            required property string name
+                            required property string path
+                            required property bool isDir
+                            required property string detail
+                            required property bool hidden
+                            required property string appIcon
+                            required property string appId
+                            required property string iconName
+                            readonly property bool hasCursor: root.cursorActive && gcell.index === root.selectedIndex
+                            readonly property bool inSet: !!root.selectedPaths[path]
+                            width: root.gridCellWidth
+                            height: root.cellHeight
+                            radius: root.cornerRadius
+                            color: gcell.hasCursor ? root.selectedBackground : (gcell.inSet ? Util.alpha(root.selectedBackground, 0.35) : "transparent")
+                            borderSpec: gcell.hasCursor ? root.selectedBorderSpec : Border.none()
+
+                            Column {
+                                anchors.fill: parent
+                                anchors.leftMargin: Style.space(8)
+                                anchors.rightMargin: Style.space(8)
+                                anchors.topMargin: Style.space(10)
+                                anchors.bottomMargin: Style.space(8)
+                                spacing: Style.space(6)
+
+                                Item {
+                                    width: parent.width
+                                    height: Style.space(48)
+                                    Image {
+                                        id: gridAppImage
+                                        anchors.centerIn: parent
+                                        width: Style.space(44)
+                                        height: Style.space(44)
+                                        visible: gcell.appId !== ""
+                                        source: {
+                                            if (!visible) return ""
+                                            var aname = String(gcell.appIcon || "")
+                                            if (!aname) return ""
+                                            if (aname.indexOf("/") === 0 || aname.indexOf("file://") === 0) return aname.indexOf("file://") === 0 ? aname : Util.fileUrl(aname)
+                                            if (root.appLibrary) {
+                                                try {
+                                                    var s = root.appLibrary.iconSource(aname)
+                                                    if (s && String(s).length) return s
+                                                } catch(e) {}
+                                            }
+                                            var qp = Quickshell.iconPath(aname, true)
+                                            if (qp && String(qp).length) return qp
+                                            return ""
+                                        }
+                                        fillMode: Image.PreserveAspectFit
+                                        asynchronous: true
+                                        onStatusChanged: if (status === Image.Error) visible = false
+                                    }
+                                    Image {
+                                        id: gridFileImage
+                                        anchors.centerIn: parent
+                                        width: Style.space(44)
+                                        height: Style.space(44)
+                                        visible: gcell.appId === "" && gcell.iconName !== ""
+                                        source: visible ? Quickshell.iconPath(gcell.iconName, true) : ""
+                                        fillMode: Image.PreserveAspectFit
+                                        asynchronous: true
+                                        onStatusChanged: if (status === Image.Error) visible = false
+                                    }
+                                    Text {
+                                        visible: !gridAppImage.visible && !gridFileImage.visible
+                                        textFormat: Text.PlainText
+                                        anchors.centerIn: parent
+                                        text: gcell.isDir ? "📁" : (gcell.hidden ? "·" : "📄")
+                                        color: gcell.hasCursor ? root.selectedText : root.foreground
+                                        opacity: gcell.isDir ? 0.9 : 0.7
+                                        font.family: root.fontFamily
+                                        font.pixelSize: Style.font.iconLarge
+                                    }
+                                }
+
+                                Text {
+                                    textFormat: Text.PlainText
+                                    width: parent.width
+                                    text: (gcell.inSet ? "● " : "") + gcell.name
+                                    color: gcell.hasCursor ? root.selectedText : root.foreground
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.bodySmall
+                                    font.weight: gcell.isDir ? Font.Medium : Font.Normal
+                                    elide: Text.ElideMiddle
+                                    horizontalAlignment: Text.AlignHCenter
+                                    opacity: gcell.hidden ? 0.6 : 1.0
+                                }
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onEntered: root.selectFromPointer(gcell.index, gcell, {x: mouseX, y: mouseY})
+                                onPositionChanged: function(mouse){ root.selectFromPointer(gcell.index, gcell, mouse) }
+                                onClicked: function(mouse) {
+                                    if (!openWithMode && (mouse.modifiers & Qt.ShiftModifier)) {
+                                        root.rangeSelectTo(gcell.index, (mouse.modifiers & Qt.ControlModifier))
+                                        return
+                                    }
+                                    if (!openWithMode && (mouse.modifiers & Qt.ControlModifier)) {
+                                        root.toggleSelect(gcell.index)
+                                        return
+                                    }
+                                    root.cursorActive = true
+                                    root.selectedIndex = gcell.index
+                                    root.activateIndex(gcell.index)
+                                }
+                                onPressAndHold: {
+                                    root.copyPath(gcell.path)
                                 }
                             }
                         }
@@ -2573,7 +4202,199 @@ Item {
                             width: parent.width
                         }
                     }
-                }
+                    } // listContainer
+
+                    // Preview pane — selection-only; list icons unchanged
+                    Item {
+                        id: previewPane
+                        visible: root.previewVisible
+                        width: root.previewVisible ? root.previewWidth : 0
+                        height: parent.height
+                        clip: true
+
+                        Column {
+                            anchors.fill: parent
+                            spacing: Style.space(8)
+
+                            Text {
+                                id: previewTitle
+                                textFormat: Text.PlainText
+                                width: parent.width
+                                text: root.previewName !== "" ? root.previewName : (root.previewLoading ? "Loading…" : "—")
+                                color: root.foreground
+                                opacity: 0.85
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.body
+                                font.weight: Font.Medium
+                                elide: Text.ElideMiddle
+                            }
+
+                            Item {
+                                id: previewVisualBox
+                                width: parent.width
+                                // Clamped to what the pane actually has: title +
+                                // visual + divider (1px) + meta + 3 gaps must
+                                // equal the pane, never spill under the footer.
+                                height: Math.max(0, parent.height - previewTitle.implicitHeight - previewMetaColumn.implicitHeight - parent.spacing * 3 - 1)
+                                clip: true
+
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: root.cornerRadius
+                                    color: Qt.rgba(1,1,1,0.04)
+                                    border.width: 1
+                                    border.color: Util.alpha(root.foreground, 0.08)
+                                }
+
+                                Image {
+                                    id: previewImage
+                                    anchors.fill: parent
+                                    anchors.margins: Style.space(8)
+                                    visible: (root.previewKind === "image" || root.previewKind === "video" || root.previewKind === "pdf") && root.previewUrl !== ""
+                                    source: visible ? root.previewUrl : ""
+                                    fillMode: Image.PreserveAspectFit
+                                    asynchronous: true
+                                    cache: true
+                                    smooth: true
+                                    sourceSize.width: 640
+                                    sourceSize.height: 640
+                                    onStatusChanged: if (status === Image.Error) visible = false
+                                }
+
+                                Image {
+                                    id: previewAppImage
+                                    anchors.centerIn: parent
+                                    width: Style.space(64)
+                                    height: Style.space(64)
+                                    visible: root.previewKind === "app" && root.previewAppIcon !== ""
+                                    source: {
+                                        if (!visible) return ""
+                                        var aname = String(root.previewAppIcon || "")
+                                        if (!aname) return ""
+                                        if (aname.indexOf("/") === 0 || aname.indexOf("file://") === 0) return aname.indexOf("file://") === 0 ? aname : Util.fileUrl(aname)
+                                        if (root.appLibrary) {
+                                            try {
+                                                var s = root.appLibrary.iconSource(aname)
+                                                if (s && String(s).length) return s
+                                            } catch(e) {}
+                                        }
+                                        var qp = Quickshell.iconPath(aname, true)
+                                        if (qp && String(qp).length) return qp
+                                        return ""
+                                    }
+                                    fillMode: Image.PreserveAspectFit
+                                    asynchronous: true
+                                    cache: true
+                                    onStatusChanged: if (status === Image.Error) visible = false
+                                }
+
+                                Text {
+                                    // Last-resort visual: shown whenever no image
+                                    // and no text snippet is on display, so the
+                                    // box is never inexplicably empty.
+                                    visible: !previewImage.visible && !previewAppImage.visible && !(root.previewKind === "text" && root.previewText !== "")
+                                    textFormat: Text.PlainText
+                                    anchors.centerIn: parent
+                                    text: root.previewLoading ? "…" : (root.previewKind === "folder" ? "📁" : (root.previewKind === "app" ? "◈" : "📄"))
+                                    color: root.foreground
+                                    opacity: 0.7
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.display
+                                }
+
+                                Text {
+                                    id: previewTextContent
+                                    visible: root.previewKind === "text" && root.previewText !== ""
+                                    textFormat: Text.PlainText
+                                    anchors.fill: parent
+                                    anchors.margins: Style.space(10)
+                                    text: root.previewText
+                                    color: root.foreground
+                                    opacity: 0.85
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.bodySmall
+                                    wrapMode: Text.WordWrap
+                                    elide: Text.ElideRight
+                                    clip: true
+                                }
+                            }
+
+                            Rectangle { width: parent.width; height: 1; color: Util.alpha(root.foreground, 0.12) }
+
+                            Column {
+                                id: previewMetaColumn
+                                width: parent.width
+                                spacing: 2
+                                Text {
+                                    textFormat: Text.PlainText
+                                    width: parent.width
+                                    text: root.previewMetaPath
+                                    visible: root.previewMetaPath !== ""
+                                    color: root.foreground
+                                    opacity: 0.55
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    elide: Text.ElideMiddle
+                                }
+                                Text {
+                                    textFormat: Text.PlainText
+                                    width: parent.width
+                                    text: {
+                                        var parts = []
+                                        if (root.previewMetaSize) parts.push(root.previewMetaSize)
+                                        if (root.previewMetaModified) parts.push(root.previewMetaModified)
+                                        return parts.join("  •  ")
+                                    }
+                                    visible: root.previewMetaSize !== "" || root.previewMetaModified !== ""
+                                    color: root.foreground
+                                    opacity: 0.55
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    elide: Text.ElideRight
+                                }
+                                Text {
+                                    textFormat: Text.PlainText
+                                    width: parent.width
+                                    text: root.previewMetaType
+                                    visible: root.previewMetaType !== ""
+                                    color: root.foreground
+                                    opacity: 0.55
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    elide: Text.ElideRight
+                                }
+                                Text {
+                                    textFormat: Text.PlainText
+                                    width: parent.width
+                                    text: {
+                                        if (root.previewMetaExtra.indexOf("DIM:") === 0) return root.previewMetaExtra.slice(4).trim() + " px"
+                                        if (root.previewMetaExtra.indexOf("PAGES:") === 0) return root.previewMetaExtra.slice(6).trim() + " pages"
+                                        if (root.previewMetaExtra.indexOf("ITEMS:") === 0) return root.previewMetaExtra.slice(6).trim() + " items"
+                                        if (root.previewMetaExtra.indexOf("MEDIA:") === 0) return root.previewMetaExtra.slice(6).trim()
+                                        return root.previewMetaExtra
+                                    }
+                                    visible: root.previewMetaExtra !== ""
+                                    color: root.foreground
+                                    opacity: 0.55
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    elide: Text.ElideRight
+                                }
+                                Text {
+                                    textFormat: Text.PlainText
+                                    width: parent.width
+                                    text: root.previewMetaPerms
+                                    visible: root.previewMetaPerms !== ""
+                                    color: root.foreground
+                                    opacity: 0.4
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.caption
+                                    elide: Text.ElideRight
+                                }
+                            }
+                        }
+                    }
+                } // Row (list + preview)
 
                 // Persistent footer — single, always visible (merged)
                 Rectangle {
