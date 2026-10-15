@@ -3173,6 +3173,10 @@ Item {
                                         font.pixelSize: Style.font.body
                                         clip: true
                                         selectByMouse: true
+                                        // Security bound (marketplace review): caps any
+                                        // foreign-clipboard read at Linux NAME_MAX.
+                                        // No legitimate filename exceeds it.
+                                        maximumLength: 255
                                         onTextEdited: root.renameText = text
                                         Keys.priority: Keys.BeforeItem
                                         Keys.onPressed: function(event) {
@@ -3342,6 +3346,10 @@ Item {
                                         font.pixelSize: Style.font.body
                                         clip: true
                                         selectByMouse: true
+                                        // Security bound (marketplace review): caps any
+                                        // foreign-clipboard read at Linux NAME_MAX.
+                                        // No legitimate filename exceeds it.
+                                        maximumLength: 255
                                         onTextEdited: root.createText = text
                                         Keys.priority: Keys.BeforeItem
                                         Keys.onPressed: function(event) {

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "killie.omafinder",
   "name": "Omafinder",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "Killiivalavan",
   "description": "A transient keyboard-first file navigator for quickly finding and managing files in Omarchy",
   "kinds": ["overlay"],
