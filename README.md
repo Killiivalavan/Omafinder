@@ -160,9 +160,11 @@ falls back to the home directory.
 ## Preview
 
 `Ctrl+Shift+P` toggles a preview pane that follows the selected item. Images
-render whole-image; videos and PDFs show first-page thumbnails; text files
-show a snippet; folders show an item count. Every preview carries file
-metadata: size, modified time, type, dimensions or duration, and permissions.
+show a ≤512px thumbnail produced by a bounded child process (never decoded by
+the shell itself); videos and PDFs show first-page thumbnails; text files
+show a snippet; folders show an item count. Every preview carries modified
+time, type, dimensions or duration, and permissions; files also carry their
+size, folders don't.
 
 The pane choice is remembered. Thumbnails are cached under
 `~/.cache/omafinder/` and only the selected item ever loads, so browsing stays

@@ -87,6 +87,8 @@ Item {
     // Clipboard for file copy/cut/paste
     property string clipboardPath: ""
     property string clipboardOp: "" // "copy" or "cut"
+    // Field-paste isolation (marketplace review): bounded foreign clipboard read
+    property var fieldPasteTarget: null
     // Open With mode
     property bool openWithMode: false
     property string openWithFile: ""
@@ -1315,7 +1317,7 @@ Item {
         if (!src) {
             // Fallback: read uri-list from the system clipboard via wl-paste/xclip,
             // then copy into the current dir — src never enters the JS layer.
-            pasteProc.command = ["bash","-lc", "src=$(wl-paste --type text/uri-list 2>/dev/null | tr -d '\\r' | head -n1 | sed 's/^file:\\/\\///;s/%20/ /g' | tr -d '\\n'); if [ -z \"$src\" ]; then src=$(xclip -selection clipboard -o -t text/uri-list 2>/dev/null | head -n1 | sed 's/^file:\\/\\///' | tr -d '\\n'); fi; if [ -z \"$src\" ]; then echo NOCLIP; exit 0; fi; src=$(printf %s \"$src\" | sed 's/%0D//g' | head -n1); if [ ! -e \"$src\" ] && [ ! -L \"$src\" ]; then echo NOTFOUND:$src; exit 0; fi; dest=" + Util.shellQuote(currentDir) + "/$(basename -- \"$src\"); if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then echo EXISTS:$dest; exit 0; fi; gio copy \"$src\" \"$dest\" 2>/dev/null || cp -an -- \"$src\" \"$dest\" 2>/dev/null; if [ $? -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"]
+            pasteProc.command = ["bash","-lc", "src=$(timeout 2 wl-paste --type text/uri-list 2>/dev/null | head -c 4096 | tr -d '\\r' | head -n1 | sed 's/^file:\\/\\///;s/%20/ /g' | tr -d '\\n'); if [ -z \"$src\" ]; then src=$(timeout 2 xclip -selection clipboard -o -t text/uri-list 2>/dev/null | head -c 4096 | head -n1 | sed 's/^file:\\/\\///' | tr -d '\\n'); fi; if [ -z \"$src\" ]; then echo NOCLIP; exit 0; fi; src=$(printf %s \"$src\" | sed 's/%0D//g' | head -n1); if [ ! -e \"$src\" ] && [ ! -L \"$src\" ]; then echo NOTFOUND:$src; exit 0; fi; dest=" + Util.shellQuote(currentDir) + "/$(basename -- \"$src\"); if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then echo EXISTS:$dest; exit 0; fi; gio copy \"$src\" \"$dest\" 2>/dev/null || cp -an -- \"$src\" \"$dest\" 2>/dev/null; if [ $? -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"]
             pasteProc.running = true
             return
         }
@@ -1373,6 +1375,52 @@ Item {
             // Dismiss after paste per spec
             // root.dismiss()
             if (pendingPaste.length) pasteNext()
+        }
+    }
+    // Foreign-clipboard paste for the rename/create editors (marketplace review).
+    // Qt's clipboard engine is never asked for foreign data from an editor item:
+    // the paste keys/middle-click are intercepted up front, and the only foreign
+    // read is this small child process, hard-capped in time (timeout 2) and in
+    // bytes (head -c 255). A hostile or trickling clipboard source can neither
+    // stall nor exhaust the shared shell process; worst-case footprint is 255
+    // bytes and 2 seconds, isolated in the child.
+    function pasteIntoField(target) {
+        if (!target) return
+        if (pasteTextProc.running) return
+        fieldPasteTarget = target
+        pasteTextProc.command = ["bash","-lc","timeout 2 wl-paste -n 2>/dev/null | head -c 255 | tr -d '\\n\\r'"]
+        pasteTextProc.running = true
+    }
+    function insertPastedText(target, s) {
+        if (!target) return
+        var t = String(s||"")
+        if (!t) return
+        var selStart = target.selectionStart
+        var selEnd = target.selectionEnd
+        var cur = target.cursorPosition
+        var base = String(target.text||"")
+        if (selEnd > selStart) {
+            base = base.substring(0, selStart) + base.substring(selEnd)
+            cur = selStart
+        }
+        var nt = base.substring(0, cur) + t + base.substring(cur)
+        target.text = nt // maximumLength: 255 truncates as the second bound
+        target.cursorPosition = Math.min(cur + t.length, target.text.length)
+        if (target === renameInputLoader.item) root.renameText = target.text
+        if (target === createInputLoader.item) root.createText = target.text
+    }
+    Process {
+        id: pasteTextProc
+        stdout: StdioCollector { id: pasteTextOutput; waitForEnd: true }
+        onExited: function(code){
+            var t = String(pasteTextOutput.text||"")
+            var target = fieldPasteTarget
+            fieldPasteTarget = null
+            if (!target) return
+            // Guard against stale targets: the dialog may have been closed
+            // (Loader destroyed) while the capped read was in flight.
+            if (renameInputLoader.item !== target && createInputLoader.item !== target) return
+            insertPastedText(target, t)
         }
     }
     function revealInFileManager(path) {
@@ -1506,7 +1554,7 @@ Item {
         renameError = ""
         renameSelected = 1
         renameOpen = true
-        Qt.callLater(function(){ if (renameInput) { renameInput.forceActiveFocus(); renameInput.selectAll() } })
+        Qt.callLater(function(){ var f = renameInputLoader.item; if (f) { f.forceActiveFocus(); f.selectAll() } })
     }
     function cancelRename() {
         renameOpen = false
@@ -1555,7 +1603,7 @@ Item {
         createError = ""
         createSelected = 1
         createOpen = true
-        Qt.callLater(function(){ if (createInput) { createInput.forceActiveFocus() } })
+        Qt.callLater(function(){ var f = createInputLoader.item; if (f) { f.forceActiveFocus() } })
     }
     function cancelCreate() {
         createOpen = false
@@ -1593,7 +1641,7 @@ Item {
             var out = String(createOutput.text||"").trim()
             if (out === "EXISTS") {
                 createError = "An item with that name already exists"
-                Qt.callLater(function(){ if (createInput) { createInput.forceActiveFocus(); createInput.selectAll() } })
+                Qt.callLater(function(){ var f = createInputLoader.item; if (f) { f.forceActiveFocus(); f.selectAll() } })
                 return
             }
             if (out.indexOf("CREATED:")===0) {
@@ -1624,7 +1672,7 @@ Item {
             var out = String(renameOutput.text||"").trim()
             if (out === "EXISTS") {
                 renameError = "An item with that name already exists"
-                Qt.callLater(function(){ if (renameInput) { renameInput.forceActiveFocus(); renameInput.selectAll() } })
+                Qt.callLater(function(){ var f = renameInputLoader.item; if (f) { f.forceActiveFocus(); f.selectAll() } })
                 return
             }
             if (out.indexOf("MOVED:")===0) {
@@ -2074,10 +2122,27 @@ Item {
         if (previewProc.running) previewProc.running = false
         if (metaProc.running) metaProc.running = false
         if (kind === "image") {
-            // Direct load — QML decodes async; sourceSize in the Image caps texture.
-            // A failure falls back to the icon via Image onStatusChanged.
-            previewUrl = Util.fileUrl(path)
-            previewLoading = false
+            // Marketplace review fix: the shell must never decode foreign image
+            // bytes. sourceSize on the preview Image is a post-decode cap —
+            // PNG-family decoders inflate the whole bitmap first, so a crafted
+            // file would spike memory inside the shared shell before any cap
+            // applies. Route through the bounded child pipeline instead:
+            // ImageMagick with hard -limit memory/map/disk caps + timeout,
+            // reusing the video/pdf THUMB:/NOTHUMB protocol and cache. The
+            // shell only ever loads a small JPEG this child produced; failure
+            // yields the icon fallback. Animated images preview as a static
+            // first frame.
+            previewRequest = path
+            previewRequestKind = "image"
+            var icmd = "f=" + Util.shellQuote(path) + "; cache=" + Util.shellQuote(previewCacheDir) + "; "
+            icmd += "mkdir -p \"$cache\"; "
+            icmd += "sig=$(stat -c '%s:%Y' -- \"$f\" 2>/dev/null || echo '0:0'); "
+            icmd += "h=$(printf '%s\\t%s' \"$f\" \"$sig\" | md5sum | cut -d ' ' -f1); "
+            icmd += "t=\"$cache/$h.jpg\"; "
+            icmd += "if [ ! -f \"$t\" ]; then timeout 8 convert -limit memory 128MiB -limit map 128MiB -limit disk 256MiB -- \"$f\"\\[0] -auto-orient -strip -thumbnail 512x512 \"$t\" >/dev/null 2>&1 || rm -f \"$t\"; fi; "
+            icmd += "if [ -f \"$t\" ]; then echo \"THUMB:$t\"; else echo NOTHUMB; fi"
+            previewProc.command = ["bash", "-lc", icmd]
+            previewProc.running = true
         } else if (kind === "text") {
             previewRequest = path
             previewRequestKind = "text"
@@ -2132,7 +2197,7 @@ Item {
         mcmd += "pages=$(timeout 8 pdfinfo -- \"$f\" 2>/dev/null | grep -i '^Pages' | awk '{print $2}' || echo ''); [ -n \"$pages\" ] && extra=\"PAGES:$pages\";; "
         mcmd += "esac; "
         mcmd += "if [ -d \"$f\" ]; then cnt=$(ls -A -- \"$f\" 2>/dev/null | wc -l | tr -d ' '); extra=\"ITEMS:$cnt\"; fi; "
-        mcmd += "echo \"SIZE:$size\"; echo \"MTIME:$mtime\"; echo \"PERMS:$perms\"; echo \"MIME:$mime\"; "
+        mcmd += "if [ ! -d \"$f\" ]; then echo \"SIZE:$size\"; fi; echo \"MTIME:$mtime\"; echo \"PERMS:$perms\"; echo \"MIME:$mime\"; "
         mcmd += "[ -n \"$extra\" ] && echo \"$extra\""
         metaProc.command = ["bash", "-lc", mcmd]
         metaProc.running = true
@@ -2529,7 +2594,7 @@ Item {
                 if (snippet.length > 4096) snippet = snippet.slice(0, 4096)
                 root.previewText = snippet
                 root.previewLoading = false
-            } else if (kind === "video" || kind === "pdf") {
+            } else if (kind === "video" || kind === "pdf" || kind === "image") {
                 if (trimmed.indexOf("THUMB:") === 0) {
                     var thumb = trimmed.slice(6).trim()
                     if (thumb) {
@@ -3126,7 +3191,7 @@ Item {
                             padding: Style.space(18)
                             radius: root.cornerRadius
 
-                            MouseArea { anchors.fill: parent; onClicked: { if (renameInput) renameInput.forceActiveFocus() } }
+                            MouseArea { anchors.fill: parent; onClicked: { if (renameInputLoader.item) renameInputLoader.item.forceActiveFocus() } }
 
                             Item {
                                 anchors.fill: parent
@@ -3156,41 +3221,77 @@ Item {
                                     height: Style.space(40)
                                     radius: root.cornerRadius
                                     color: Qt.rgba(1,1,1,0.04)
-                                    border.width: renameInput.activeFocus ? 1 : 0
+                                    border.width: (renameInputLoader.item ? renameInputLoader.item.activeFocus : false) ? 1 : 0
                                     border.color: Util.alpha(root.selectedText, 0.6)
 
-                                    TextInput {
-                                        id: renameInput
+                                    // Foreign-clipboard isolation (marketplace review):
+                                    // the editor is created only while the dialog is open, so
+                                    // it is never subscribed to clipboard changes while the
+                                    // overlay is hidden. Qt's clipboard engine is never asked
+                                    // for foreign data from this item: paste keys are
+                                    // intercepted below, middle-click is consumed by a
+                                    // sibling MouseArea, and insertion of foreign text is
+                                    // done by the byte- and time-capped child process in
+                                    // pasteIntoField().
+                                    Loader {
+                                        id: renameInputLoader
                                         anchors.left: parent.left
                                         anchors.right: parent.right
                                         anchors.leftMargin: Style.space(12)
                                         anchors.rightMargin: Style.space(12)
                                         anchors.verticalCenter: parent.verticalCenter
-                                        height: implicitHeight
-                                        text: renameText
-                                        color: root.foreground
-                                        font.family: root.fontFamily
-                                        font.pixelSize: Style.font.body
-                                        clip: true
-                                        selectByMouse: true
-                                        // Security bound (marketplace review): caps any
-                                        // foreign-clipboard read at Linux NAME_MAX.
-                                        // No legitimate filename exceeds it.
-                                        maximumLength: 255
-                                        onTextEdited: root.renameText = text
-                                        Keys.priority: Keys.BeforeItem
-                                        Keys.onPressed: function(event) {
-                                            if (event.key === Qt.Key_Escape) {
-                                                cancelRename()
-                                                event.accepted = true
-                                            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                                                confirmRename()
-                                                event.accepted = true
+                                        active: root.renameOpen
+                                        sourceComponent: TextInput {
+                                            id: renameInput
+                                            anchors.left: parent.left
+                                            anchors.right: parent.right
+                                            height: implicitHeight
+                                            text: root.renameText
+                                            color: root.foreground
+                                            font.family: root.fontFamily
+                                            font.pixelSize: Style.font.body
+                                            clip: true
+                                            selectByMouse: true
+                                            // Security bound (marketplace review): caps any
+                                            // foreign-clipboard read at Linux NAME_MAX.
+                                            // No legitimate filename exceeds it.
+                                            maximumLength: 255
+                                            onTextEdited: root.renameText = text
+                                            Keys.priority: Keys.BeforeItem
+                                            Keys.onPressed: function(event) {
+                                                if (event.key === Qt.Key_Escape) {
+                                                    root.cancelRename()
+                                                    event.accepted = true
+                                                } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                                                    root.confirmRename()
+                                                    event.accepted = true
+                                                } else if ((event.key === Qt.Key_V && (event.modifiers & Qt.ControlModifier))
+                                                           || (event.key === Qt.Key_Insert && (event.modifiers & Qt.ShiftModifier))) {
+                                                    // Keep Qt's QKeySequence::Paste handler away from
+                                                    // the clipboard: QQuickTextInputPrivate::paste()
+                                                    // reads QClipboard::text() synchronously on the
+                                                    // GUI thread. Route through the capped child.
+                                                    root.pasteIntoField(renameInput)
+                                                    event.accepted = true
+                                                } else if (event.key === Qt.Key_XF86Paste) {
+                                                    root.pasteIntoField(renameInput)
+                                                    event.accepted = true
+                                                }
+                                            }
+                                            Component.onCompleted: {
+                                                if (root.renameOpen) { forceActiveFocus(); selectAll() }
                                             }
                                         }
-                                        Component.onCompleted: {
-                                            if (renameOpen) { forceActiveFocus(); selectAll() }
-                                        }
+                                    }
+
+                                    // Middle-click blocker (marketplace review): consumes
+                                    // the middle button so it can never reach the TextInput.
+                                    // QQuickTextInput::mouseReleaseEvent calls
+                                    // QClipboard::text(Selection) synchronously for
+                                    // middle-click paste — an unbounded foreign read.
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        acceptedButtons: Qt.MiddleButton
                                     }
                                 }
 
@@ -3283,7 +3384,7 @@ Item {
                             padding: Style.space(18)
                             radius: root.cornerRadius
 
-                            MouseArea { anchors.fill: parent; onClicked: { if (createInput) createInput.forceActiveFocus() } }
+                            MouseArea { anchors.fill: parent; onClicked: { if (createInputLoader.item) createInputLoader.item.forceActiveFocus() } }
 
                             Item {
                                 anchors.fill: parent
@@ -3313,7 +3414,7 @@ Item {
                                     height: Style.space(40)
                                     radius: root.cornerRadius
                                     color: Qt.rgba(1,1,1,0.04)
-                                    border.width: createInput.activeFocus ? 1 : 0
+                                    border.width: (createInputLoader.item ? createInputLoader.item.activeFocus : false) ? 1 : 0
                                     border.color: Util.alpha(root.selectedText, 0.6)
 
                                     Text {
@@ -3332,38 +3433,61 @@ Item {
                                         elide: Text.ElideRight
                                     }
 
-                                    TextInput {
-                                        id: createInput
+                                    // Foreign-clipboard isolation (marketplace review):
+                                    // same hardening as renameInputLoader. The editor exists
+                                    // only while the dialog is open; Qt's clipboard engine is
+                                    // never asked for foreign clipboard data.
+                                    Loader {
+                                        id: createInputLoader
                                         anchors.left: parent.left
                                         anchors.right: parent.right
                                         anchors.leftMargin: Style.space(12)
                                         anchors.rightMargin: Style.space(12)
                                         anchors.verticalCenter: parent.verticalCenter
-                                        height: implicitHeight
-                                        text: createText
-                                        color: root.foreground
-                                        font.family: root.fontFamily
-                                        font.pixelSize: Style.font.body
-                                        clip: true
-                                        selectByMouse: true
-                                        // Security bound (marketplace review): caps any
-                                        // foreign-clipboard read at Linux NAME_MAX.
-                                        // No legitimate filename exceeds it.
-                                        maximumLength: 255
-                                        onTextEdited: root.createText = text
-                                        Keys.priority: Keys.BeforeItem
-                                        Keys.onPressed: function(event) {
-                                            if (event.key === Qt.Key_Escape) {
-                                                cancelCreate()
-                                                event.accepted = true
-                                            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                                                confirmCreate()
-                                                event.accepted = true
+                                        active: root.createOpen
+                                        sourceComponent: TextInput {
+                                            id: createInput
+                                            anchors.left: parent.left
+                                            anchors.right: parent.right
+                                            height: implicitHeight
+                                            text: root.createText
+                                            color: root.foreground
+                                            font.family: root.fontFamily
+                                            font.pixelSize: Style.font.body
+                                            clip: true
+                                            selectByMouse: true
+                                            // Security bound (marketplace review): caps any
+                                            // foreign-clipboard read at Linux NAME_MAX.
+                                            // No legitimate filename exceeds it.
+                                            maximumLength: 255
+                                            onTextEdited: root.createText = text
+                                            Keys.priority: Keys.BeforeItem
+                                            Keys.onPressed: function(event) {
+                                                if (event.key === Qt.Key_Escape) {
+                                                    root.cancelCreate()
+                                                    event.accepted = true
+                                                } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                                                    root.confirmCreate()
+                                                    event.accepted = true
+                                                } else if ((event.key === Qt.Key_V && (event.modifiers & Qt.ControlModifier))
+                                                           || (event.key === Qt.Key_Insert && (event.modifiers & Qt.ShiftModifier))) {
+                                                    root.pasteIntoField(createInput)
+                                                    event.accepted = true
+                                                } else if (event.key === Qt.Key_XF86Paste) {
+                                                    root.pasteIntoField(createInput)
+                                                    event.accepted = true
+                                                }
+                                            }
+                                            Component.onCompleted: {
+                                                if (root.createOpen) { forceActiveFocus() }
                                             }
                                         }
-                                        Component.onCompleted: {
-                                            if (createOpen) { forceActiveFocus() }
-                                        }
+                                    }
+
+                                    // Middle-click blocker: see renameField.
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        acceptedButtons: Qt.MiddleButton
                                     }
                                 }
 
