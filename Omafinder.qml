@@ -2135,11 +2135,18 @@ Item {
             previewRequest = path
             previewRequestKind = "image"
             var icmd = "f=" + Util.shellQuote(path) + "; cache=" + Util.shellQuote(previewCacheDir) + "; "
+            // Kernel-enforced ceiling (marketplace review): -limit flags bound
+            // ImageMagick's pixel cache only; PNG text chunks are ordinary heap
+            // allocations (png.c allocator) and bypass -limit. RLIMIT_AS counts
+            // every allocation, so the child is held at 256 MB regardless of
+            // what the file requests — the real, honest ceiling. The spill cache
+            // is steered to a real directory because /tmp is tmpfs here.
+            icmd += "ulimit -v 262144; export MAGICK_TEMPORARY_PATH=\"$cache/tmp\"; mkdir -p \"$cache/tmp\"; "
             icmd += "mkdir -p \"$cache\"; "
             icmd += "sig=$(stat -c '%s:%Y' -- \"$f\" 2>/dev/null || echo '0:0'); "
             icmd += "h=$(printf '%s\\t%s' \"$f\" \"$sig\" | md5sum | cut -d ' ' -f1); "
             icmd += "t=\"$cache/$h.jpg\"; "
-            icmd += "if [ ! -f \"$t\" ]; then timeout 8 convert -limit memory 128MiB -limit map 128MiB -limit disk 256MiB -- \"$f\"\\[0] -auto-orient -strip -thumbnail 512x512 \"$t\" >/dev/null 2>&1 || rm -f \"$t\"; fi; "
+            icmd += "if [ ! -f \"$t\" ]; then timeout 8 convert -limit memory 128MiB -limit map 128MiB -limit disk 512MiB -- \"$f\"\\[0] -auto-orient -strip -thumbnail 512x512 \"$t\" >/dev/null 2>&1 || rm -f \"$t\"; fi; "
             icmd += "if [ -f \"$t\" ]; then echo \"THUMB:$t\"; else echo NOTHUMB; fi"
             previewProc.command = ["bash", "-lc", icmd]
             previewProc.running = true
@@ -2153,6 +2160,9 @@ Item {
             previewRequestKind = "video"
             var vcmd = "f=" + Util.shellQuote(path) + "; cache=" + Util.shellQuote(previewCacheDir) + "; "
             vcmd += "mkdir -p \"$cache\"; "
+            // Same kernel-enforced ceiling approach as the image child.
+            // ffmpeg's transient address space needs more headroom than IM.
+            vcmd += "ulimit -v 393216; "
             vcmd += "sig=$(stat -c '%s:%Y' -- \"$f\" 2>/dev/null || echo '0:0'); "
             vcmd += "h=$(printf '%s\\t%s' \"$f\" \"$sig\" | md5sum | cut -d ' ' -f1); "
             vcmd += "t=\"$cache/$h.jpg\"; "
@@ -2165,6 +2175,8 @@ Item {
             previewRequestKind = "pdf"
             var pcmd = "f=" + Util.shellQuote(path) + "; cache=" + Util.shellQuote(previewCacheDir) + "; "
             pcmd += "mkdir -p \"$cache\"; "
+            // Same kernel-enforced ceiling approach as the image child.
+            pcmd += "ulimit -v 262144; "
             pcmd += "sig=$(stat -c '%s:%Y' -- \"$f\" 2>/dev/null || echo '0:0'); "
             pcmd += "h=$(printf '%s\\t%s' \"$f\" \"$sig\" | md5sum | cut -d ' ' -f1); "
             pcmd += "base=\"$cache/$h\"; out=\"$base.jpg\"; "
@@ -2183,18 +2195,20 @@ Item {
         // Meta for every kind (single stat + file + kind-specific extra)
         previewMetaRequest = path
         var mcmd = "f=" + Util.shellQuote(path) + "; "
+        // IM spill cache to disk (see image preview child).
+        mcmd += "export MAGICK_TEMPORARY_PATH=" + Util.shellQuote(previewCacheDir + "/tmp") + "; mkdir -p " + Util.shellQuote(previewCacheDir + "/tmp") + "; "
         mcmd += "size=$(stat -c '%s' -- \"$f\" 2>/dev/null || echo ''); "
         mcmd += "mtime=$(stat -c '%Y' -- \"$f\" 2>/dev/null || echo ''); "
         mcmd += "perms=$(stat -c '%A' -- \"$f\" 2>/dev/null || echo ''); "
-        mcmd += "mime=$(timeout 8 file -b --mime-type -- \"$f\" 2>/dev/null | tr -d '\\n' || echo ''); "
+        mcmd += "mime=$( (ulimit -v 262144; timeout 8 file -b --mime-type -- \"$f\") 2>/dev/null | tr -d '\\n' || echo ''); "
         mcmd += "extra=''; "
         mcmd += "case \"$f\" in "
         mcmd += "*.jpg|*.JPG|*.jpeg|*.JPEG|*.png|*.PNG|*.gif|*.GIF|*.bmp|*.BMP|*.webp|*.WEBP|*.svg|*.SVG) "
-        mcmd += "dim=$(timeout 8 identify -format '%wx%h' -- \"$f\" 2>/dev/null || echo ''); [ -n \"$dim\" ] && extra=\"DIM:$dim\";; "
+        mcmd += "dim=$( (ulimit -v 262144; timeout 8 identify -ping -limit memory 128MiB -limit map 128MiB -limit disk 512MiB -format '%wx%h' -- \"$f\") 2>/dev/null || echo ''); [ -n \"$dim\" ] && extra=\"DIM:$dim\";; "
         mcmd += "*.mp4|*.MP4|*.mkv|*.MKV|*.webm|*.WEBM|*.mov|*.MOV|*.avi|*.AVI|*.m4v|*.M4V) "
-        mcmd += "probe=$(timeout 8 ffprobe -v quiet -show_entries stream=width,height,duration -of default=nw=1:nk=1 -- \"$f\" 2>/dev/null | head -n 8 | tr '\\n' ' ' | cut -c1-80 || echo ''); [ -n \"$probe\" ] && extra=\"MEDIA:$probe\";; "
+        mcmd += "probe=$( (ulimit -v 393216; timeout 8 ffprobe -v quiet -show_entries stream=width,height,duration -of default=nw=1:nk=1 -- \"$f\") 2>/dev/null | head -n 8 | tr '\\n' ' ' | cut -c1-80 || echo ''); [ -n \"$probe\" ] && extra=\"MEDIA:$probe\";; "
         mcmd += "*.pdf|*.PDF) "
-        mcmd += "pages=$(timeout 8 pdfinfo -- \"$f\" 2>/dev/null | grep -i '^Pages' | awk '{print $2}' || echo ''); [ -n \"$pages\" ] && extra=\"PAGES:$pages\";; "
+        mcmd += "pages=$( (ulimit -v 262144; timeout 8 pdfinfo -- \"$f\") 2>/dev/null | grep -i '^Pages' | awk '{print $2}' || echo ''); [ -n \"$pages\" ] && extra=\"PAGES:$pages\";; "
         mcmd += "esac; "
         mcmd += "if [ -d \"$f\" ]; then cnt=$(ls -A -- \"$f\" 2>/dev/null | wc -l | tr -d ' '); extra=\"ITEMS:$cnt\"; fi; "
         mcmd += "if [ ! -d \"$f\" ]; then echo \"SIZE:$size\"; fi; echo \"MTIME:$mtime\"; echo \"PERMS:$perms\"; echo \"MIME:$mime\"; "
@@ -2208,6 +2222,7 @@ Item {
     // Mounting is delegated to udisks2 (same service Files uses); if polkit
     // needs auth, the system agent prompts — this plugin never handles secrets.
     // Encrypted volumes are never prompted here: they hand off to Files.
+
     function openDrives() {
         if (renameOpen || createOpen || helpOpen || trashConfirmOpen || multiConfirmOpen) return
         drivesOpen = true
@@ -2223,6 +2238,7 @@ Item {
         drivesMonitorProc.running = true
         Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
     }
+
     function closeDrives() {
         drivesOpen = false
         if (drivesFetchProc.running) drivesFetchProc.running = false
@@ -2233,10 +2249,12 @@ Item {
         drivesMountRequest = ""
         Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
     }
+
     function toggleDrives() {
         if (drivesOpen) closeDrives()
         else openDrives()
     }
+
     function fetchDrives() {
         drivesLoading = true
         drivesQuietRefresh = false
@@ -2246,8 +2264,10 @@ Item {
         drivesFetchProc.command = ["bash", "-lc", "lsblk -J -o NAME,FSTYPE,LABEL,SIZE,MOUNTPOINT,UUID,PARTTYPE,TRAN 2>/dev/null"]
         drivesFetchProc.running = true
     }
+
     // Background refresh: same fetch, but the painted list stays until the
     // new parse swaps in — no flicker, selection and errors preserved.
+
     function fetchDrivesQuiet() {
         if (!drivesOpen) return
         if (drivesFetchProc.running) { drivesRefreshPending = true; return }
@@ -2256,12 +2276,12 @@ Item {
         drivesFetchProc.command = ["bash", "-lc", "lsblk -J -o NAME,FSTYPE,LABEL,SIZE,MOUNTPOINT,UUID,PARTTYPE,TRAN 2>/dev/null"]
         drivesFetchProc.running = true
     }
+
     function drivesMonitorEvent(line) {
         if (!drivesOpen) return
         if (!String(line || "").trim()) return
         drivesMonitorDebounce.restart()
-    }
-    function drivesMonitorRefresh() {
+    }    function drivesMonitorRefresh() {
         if (!drivesOpen) return
         // Our own successful mount dismisses the overlay first; a queued
         // monitor burst must not resurrect anything.
