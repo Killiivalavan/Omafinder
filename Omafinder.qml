@@ -70,10 +70,12 @@ Item {
     property var selectedPaths: ({})
     property int selectedCount: 0
     property int anchorIndex: -1
-    // Multi-file clipboard/paste queue, multi-trash, multi-open confirm
+    // Multi-file clipboard/paste queue, trash confirm, multi-open confirm
     property var clipboardPaths: []
     property var pendingPaste: []
-    property var multiTrashPaths: []
+    // Single pending trash payload (paths). Drives both the dialog text and
+    // the executed action, so they can never disagree.
+    property var trashPaths: []
     property bool multiConfirmOpen: false
     property string multiConfirmMessage: ""
     property var pendingMultiOpen: []
@@ -95,7 +97,6 @@ Item {
     readonly property var appLibrary: shell && shell.appLibrary ? shell.appLibrary : null
     // Trash confirm
     property bool trashConfirmOpen: false
-    property var trashTarget: null
     // Help
     property bool helpOpen: false
     // Rename
@@ -161,6 +162,9 @@ Item {
         isSearching = false
         openWithMode = false
         openWithFile = ""
+        openWithMime = ""
+        openWithRecommendedIds = []
+        openWithAllIds = []
         // Never paint another session's ghost: a deleted file's preview must
         // not survive into a fresh open (stale image, stale metadata).
         previewPath = ""
@@ -187,12 +191,16 @@ Item {
         if (previewProc.running) previewProc.running = false
         if (metaProc.running) metaProc.running = false
         previewDebounce.stop()
+        trashRefreshTimer.stop()
         root.opened = false
         root.isAnimatingOut = false
         openWithMode = false
         openWithFile = ""
+        openWithMime = ""
+        openWithRecommendedIds = []
+        openWithAllIds = []
         trashConfirmOpen = false
-        trashTarget = null
+        trashPaths = []
         multiConfirmOpen = false
         pendingMultiOpen = []
         pendingMultiDir = ""
@@ -531,6 +539,8 @@ Item {
         // Don't search for very short queries (1 char) - just filter current dir
         if (q.length < 2) { isSearching = false; rebuildDisplay(); return }
         isSearching = true
+        // Drop the stale preview so search churn doesn't chase it
+        root.clearPreview()
         // Show transient searching state
         displayModel.clear()
         displayModel.append({name:"Searching…", path:"", isDir:false, detail:"", hidden:false, iconName: "system-search"})
@@ -1098,6 +1108,7 @@ Item {
         stdout: SplitParser { onRead: function(l){ statProc.collected += l + "\n" } }
         onStarted: collected = ""
         onExited: function(code){
+            if (!root.opened) { root.pendingActivatePath = ""; return }
             var out = String(collected||"").trim()
             var path = root.pendingActivatePath
             root.pendingActivatePath = ""
@@ -1229,6 +1240,7 @@ Item {
         stdout: SplitParser { onRead: function(l){ statDirectProc.collected += l + "\n" } }
         onStarted: collected = ""
         onExited: function(c){
+            if (!root.opened) { root.pendingActivatePath=""; root.pendingDirectFilter=""; return }
             var out = String(collected||"").trim()
             var exp = root.pendingActivatePath
             var q = root.pendingDirectFilter
@@ -1317,7 +1329,7 @@ Item {
         if (!src) {
             // Fallback: read uri-list from the system clipboard via wl-paste/xclip,
             // then copy into the current dir — src never enters the JS layer.
-            pasteProc.command = ["bash","-lc", "src=$(timeout 2 wl-paste --type text/uri-list 2>/dev/null | head -c 4096 | tr -d '\\r' | head -n1 | sed 's/^file:\\/\\///;s/%20/ /g' | tr -d '\\n'); if [ -z \"$src\" ]; then src=$(timeout 2 xclip -selection clipboard -o -t text/uri-list 2>/dev/null | head -c 4096 | head -n1 | sed 's/^file:\\/\\///' | tr -d '\\n'); fi; if [ -z \"$src\" ]; then echo NOCLIP; exit 0; fi; src=$(printf %s \"$src\" | sed 's/%0D//g' | head -n1); if [ ! -e \"$src\" ] && [ ! -L \"$src\" ]; then echo NOTFOUND:$src; exit 0; fi; dest=" + Util.shellQuote(currentDir) + "/$(basename -- \"$src\"); if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then echo EXISTS:$dest; exit 0; fi; gio copy \"$src\" \"$dest\" 2>/dev/null || cp -an -- \"$src\" \"$dest\" 2>/dev/null; if [ $? -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"]
+            pasteProc.command = ["bash","-lc", "src=$(timeout 2 wl-paste --type text/uri-list 2>/dev/null | head -c 4096 | tr -d '\\r' | head -n1 | sed 's/^file:\\/\\///;s/%20/ /g' | tr -d '\\n'); if [ -z \"$src\" ]; then src=$(timeout 2 xclip -selection clipboard -o -t text/uri-list 2>/dev/null | head -c 4096 | head -n1 | sed 's/^file:\\/\\///' | tr -d '\\n'); fi; if [ -z \"$src\" ]; then echo NOCLIP; exit 0; fi; src=$(printf %s \"$src\" | sed 's/%0D//g' | head -n1); if [ ! -e \"$src\" ] && [ ! -L \"$src\" ]; then echo NOTFOUND:$src; exit 0; fi; src_dir=" + Util.shellQuote(currentDir) + "; dest=\"$src_dir/$(basename -- \"$src\")\"; if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then echo EXISTS:$dest; exit 0; fi; gio copy -n \"$src\" \"$dest\" 2>/dev/null || cp -an -- \"$src\" \"$dest\" 2>/dev/null; if [ $? -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"]
             pasteProc.running = true
             return
         }
@@ -1339,9 +1351,9 @@ Item {
         // Avoid overwriting — find unused name
         var cmd
         if (pop === "cut") {
-            cmd = "src=" + Util.shellQuote(psrc) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ] || [ -L \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio move -- \"$src\" \"$dest\" 2>/dev/null || mv -n -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo MOVED:$dest; else echo FAIL; fi"
+            cmd = "src=" + Util.shellQuote(psrc) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ] || [ -L \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio move -n -- \"$src\" \"$dest\" 2>/dev/null || mv -n -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo MOVED:$dest; else echo FAIL; fi"
         } else {
-            cmd = "src=" + Util.shellQuote(psrc) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ] || [ -L \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio copy -- \"$src\" \"$dest\" 2>/dev/null || cp -an -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"
+            cmd = "src=" + Util.shellQuote(psrc) + "; dest=" + Util.shellQuote(dest) + "; baseDest=\"$dest\"; i=1; while [ -e \"$dest\" ] || [ -L \"$dest\" ]; do dest=\"${baseDest%.*}_$i\"; case \"$baseDest\" in *.*) ext=\".${baseDest##*.}\"; base=\"${baseDest%.*}\"; dest=\"${base}_$i$ext\";; esac; i=$((i+1)); done; gio copy -n -- \"$src\" \"$dest\" 2>/dev/null || cp -an -- \"$src\" \"$dest\" 2>/dev/null; ec=$?; if [ $ec -eq 0 ]; then echo COPIED:$dest; else echo FAIL; fi"
         }
         pasteProc.command = ["bash","-lc", cmd]
         pasteProc.running = true
@@ -1484,11 +1496,11 @@ Item {
 
     function requestTrashWithConfirm(path) {
         // A non-empty set trashes together with one confirm, not N dialogs.
+        // One payload (trashPaths) drives both the dialog text and the action.
         if (selectedCount > 0) {
             var targets = actionTargets().map(function(t){ return t.path })
             if (targets.length) {
-                multiTrashPaths = targets
-                trashTarget = null
+                trashPaths = targets
                 trashConfirm.selectedIndex = 1
                 trashConfirmOpen = true
                 return
@@ -1498,40 +1510,34 @@ Item {
         if (!p) return
         // Avoid confirming for placeholder entries
         if (p === "" || p.indexOf("Loading") === 0 || p.indexOf("No ") === 0) return
-        var name = Fuzzy.basename(p)
-        // For folders, basename may be empty if path ends with /, handle
-        if (!name || name === "/") name = p
-        trashTarget = { path: p, name: name }
+        trashPaths = [p]
         trashConfirm.selectedIndex = 1
         trashConfirmOpen = true
     }
-    function trashMultiMessage() {
-        var n = multiTrashPaths.length
-        var shown = multiTrashPaths.slice(0, 3).map(function(p){ return Fuzzy.basename(p) }).join(", ")
+    function trashConfirmMessage() {
+        var ps = trashPaths || []
+        if (ps.length <= 1) {
+            var name = ps.length === 1 ? Fuzzy.basename(ps[0]) : ""
+            if (!name || name === "/") name = ps.length === 1 ? ps[0] : ""
+            return "Move “" + String(name||"") + "” to Trash?\nRecoverable in Trash."
+        }
+        var n = ps.length
+        var shown = ps.slice(0, 3).map(function(p){ return Fuzzy.basename(p) }).join(", ")
         return "Move " + n + " items to Trash?\n" + shown + (n > 3 ? ", …" : "") + "\nRecoverable in Trash."
     }
     function cancelTrashConfirm() {
         trashConfirmOpen = false
-        trashTarget = null
-        multiTrashPaths = []
+        trashPaths = []
         trashConfirm.selectedIndex = 1
         Qt.callLater(function(){ keyCatcher.forceActiveFocus() })
     }
     function confirmTrash() {
-        if (multiTrashPaths.length > 0) {
-            var ps = multiTrashPaths
-            multiTrashPaths = []
-            trashConfirmOpen = false
-            trashTarget = null
-            trashItems(ps)
-            return
-        }
-        var t = trashTarget
+        var ps = trashPaths || []
+        trashPaths = []
         trashConfirmOpen = false
-        trashTarget = null
-        if (!t || !t.path) return
-        // Show that it's recoverable — actual trash, not rm
-        trashItem(t.path)
+        if (!ps.length) return
+        // One payload drives both display and action.
+        trashItems(ps)
     }
     function openHelp() { helpOpen = true }
     function closeHelp() { helpOpen = false; Qt.callLater(function(){ keyCatcher.forceActiveFocus() }) }
@@ -1588,7 +1594,7 @@ Item {
         // Try gio move first, fallback to mv -n (no-clobber).
         // Verify the source actually went away and the dest exists, so a
         // TOCTOU race or a no-clobber skip is reported as EXISTS, never as silent overwrite.
-        cmd += "gio move -- \"$old\" \"$new\" 2>/dev/null; if [ ! -e \"$old\" ] && [ ! -L \"$old\" ] && { [ -e \"$new\" ] || [ -L \"$new\" ]; }; then echo MOVED:$new; exit 0; fi; "
+        cmd += "gio move -n -- \"$old\" \"$new\" 2>/dev/null; if [ ! -e \"$old\" ] && [ ! -L \"$old\" ] && { [ -e \"$new\" ] || [ -L \"$new\" ]; }; then echo MOVED:$new; exit 0; fi; "
         cmd += "if [ -e \"$check\" ] || [ -L \"$check\" ]; then echo EXISTS; exit 0; fi; "
         cmd += "mv -n -- \"$old\" \"$new\" 2>/dev/null; if [ ! -e \"$old\" ] && [ ! -L \"$old\" ] && { [ -e \"$new\" ] || [ -L \"$new\" ]; }; then echo MOVED:$new; exit 0; fi; "
         cmd += "if [ -e \"$check\" ] || [ -L \"$check\" ]; then echo EXISTS; else echo FAIL; fi"
@@ -1765,6 +1771,9 @@ Item {
     function exitOpenWithMode() {
         openWithMode = false
         openWithFile = ""
+        openWithMime = ""
+        openWithRecommendedIds = []
+        openWithAllIds = []
         filterText = ""
         selectedIndex = 0
         rebuildDisplay()
@@ -2153,7 +2162,7 @@ Item {
         } else if (kind === "text") {
             previewRequest = path
             previewRequestKind = "text"
-            previewProc.command = ["bash", "-lc", "timeout 8 head -c 4096 -- " + Util.shellQuote(path) + " 2>/dev/null || true"]
+            previewProc.command = ["bash", "-lc", "ulimit -v 262144; timeout 8 head -c 4096 -- " + Util.shellQuote(path) + " 2>/dev/null || true"]
             previewProc.running = true
         } else if (kind === "video") {
             previewRequest = path
@@ -2187,7 +2196,7 @@ Item {
         } else if (kind === "folder") {
             previewRequest = path
             previewRequestKind = "folder"
-            previewProc.command = ["bash", "-lc", "ls -A -- " + Util.shellQuote(path) + " 2>/dev/null | wc -l | tr -d ' '"]
+            previewProc.command = ["bash", "-lc", "f=" + Util.shellQuote(path) + "; export f; ulimit -v 262144; timeout 8 sh -c 'ls -A -- \"$f\" 2>/dev/null | wc -l | tr -d \" \"'"]
             previewProc.running = true
         } else {
             previewLoading = false
@@ -2210,7 +2219,7 @@ Item {
         mcmd += "*.pdf|*.PDF) "
         mcmd += "pages=$( (ulimit -v 262144; timeout 8 pdfinfo -- \"$f\") 2>/dev/null | grep -i '^Pages' | awk '{print $2}' || echo ''); [ -n \"$pages\" ] && extra=\"PAGES:$pages\";; "
         mcmd += "esac; "
-        mcmd += "if [ -d \"$f\" ]; then cnt=$(ls -A -- \"$f\" 2>/dev/null | wc -l | tr -d ' '); extra=\"ITEMS:$cnt\"; fi; "
+        mcmd += "if [ -d \"$f\" ]; then cnt=$( (ulimit -v 262144; timeout 8 ls -A -- \"$f\" 2>/dev/null) | wc -l | tr -d ' '); extra=\"ITEMS:$cnt\"; fi; "
         mcmd += "if [ ! -d \"$f\" ]; then echo \"SIZE:$size\"; fi; echo \"MTIME:$mtime\"; echo \"PERMS:$perms\"; echo \"MIME:$mime\"; "
         mcmd += "[ -n \"$extra\" ] && echo \"$extra\""
         metaProc.command = ["bash", "-lc", mcmd]
@@ -2281,7 +2290,9 @@ Item {
         if (!drivesOpen) return
         if (!String(line || "").trim()) return
         drivesMonitorDebounce.restart()
-    }    function drivesMonitorRefresh() {
+    }
+
+    function drivesMonitorRefresh() {
         if (!drivesOpen) return
         // Our own successful mount dismisses the overlay first; a queued
         // monitor burst must not resurrect anything.
@@ -3142,7 +3153,7 @@ Item {
                     anchors.fill: parent
                     opened: trashConfirmOpen
                     z: 30
-                    message: trashTarget ? ("Move “" + String(trashTarget.name||"") + "” to Trash?\nRecoverable in Trash.") : (multiTrashPaths.length > 0 ? trashMultiMessage() : "Move to Trash?")
+                    message: trashConfirmMessage()
                     confirmText: "Move to Trash"
                     cancelText: "Cancel"
                     background: Color.menu.background
